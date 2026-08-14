@@ -3704,7 +3704,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             [h0, h1])
           pass.dispatchWorkgroups(Math.ceil(H / 64))
         }
-        pass.dispatchWorkgroups(Math.ceil(H / 64))
 
         // After this layer: h0 = current hidden states, h1 = scratch
       }

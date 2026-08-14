@@ -255,6 +255,10 @@ export interface EngineOptions {
    *  UMA this can skip the staging buffer copy entirely. Requires gpuDequant.
    *  Default `false`. */
   mappedUpload?: boolean
+  /** Benchmark vision tower: split the 27 layers into separate command buffers
+   *  with CPU wall-clock timing per phase. Prints per-phase breakdown to console.
+   *  Default `false` (opt-in for benchmarking). */
+  benchVision?: boolean
   /** Called as the model loads. */
   onProgress?: (progress: LoadProgress) => void
   /** Called if the GPU device is lost after creation (driver reset, OS reclaim, tab backgrounding

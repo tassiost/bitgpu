@@ -16,13 +16,18 @@ Bonsai-27B (Qwen3-VL) vision tower implementation in bitgpu.
 - LayerNorm (not RMSNorm) with eps=1e-6
 - No window attention (confirmed: Qwen3-VL removed this, unlike Qwen2.5-VL)
 
-**Performance results** (234-patch screenshot, M3 Mac, cold system):
+**Performance results** (234-patch screenshot, M3 Mac, 3-run benchmark):
 
 | Metric | Baseline | After opt | Improvement |
 |--------|----------|-----------|-------------|
-| Vision tower | 50.8s | 8.7s | 83% faster |
-| Prefill | 18.2s | 11.5s | 37% faster |
-| Tokens/s | 3.6 | 5.7 | 58% faster |
+| Vision tower | 50.8s | 5.4s | 89% faster |
+| Prefill | 18.2s | 11.0s | 40% faster |
+| Tokens/s | 3.6 | 5.9 | 64% faster |
+
+**Benchmark results** (3 runs, 234 patches, 90s cooldown between runs):
+- Run 1: 6040ms (cold), Run 2: 5451ms, Run 3: 5443ms
+- Min: 5443ms, Max: 6040ms, Avg: 5645ms
+- Per-layer: 201.6ms/layer
 
 **Red 32×32 image results**:
 
@@ -38,12 +43,47 @@ content (social media / messaging app), but still can't read exact text.
 The bicubic interpolation fix (a=-0.75 → a=-0.5) may improve this further
 with more test images.
 
-**Bandwidth analysis**: The vision tower is memory-bandwidth bound, not
-compute bound. After Q8+F16 weight optimization, total weight reads per
-layer: 22.1 MB (was 60.8 MB f32). At ~100 GB/s (M3 unified memory),
-theoretical minimum is ~5.5ms/layer. With 2D tiling + vec4 attention,
-actual is ~320ms/layer — 58× gap (was 84×). Remaining gap is from
-activation bandwidth, attention O(N²) compute, and kernel launch overhead.
+**Bottleneck analysis** (theoretical roofline @ 100 GB/s, 5 TFLOPS):
+
+| Component | Per layer | All 27 layers | Theoretical time |
+|-----------|-----------|---------------|------------------|
+| Weights (Q8+F16) | 20.8 MB | 562.8 MB | 5.6 ms |
+| Activations (f32) | 33.9 MB | 916.3 MB | 9.2 ms |
+| Memory total | 54.8 MB | 1479 MB | 14.8 ms |
+| Compute | 11.2 GFLOP | 301 GFLOP | 60.3 ms |
+| **Roofline** | | | **60.3 ms** |
+
+- **Theoretical bottleneck**: COMPUTE-BOUND (60.3ms compute vs 14.8ms memory)
+- **Actual**: 5443ms — **90× slower than compute roofline**
+- **Efficiency**: 1.1% of roofline
+
+**Why the 90× gap?** The compute roofline assumes 5 TFLOPS sustained, but:
+1. **Kernel launch overhead**: 27 layers × 7 dispatches/layer = 189 dispatches.
+   Each dispatch has ~0.1-0.5ms launch overhead → 19-95ms overhead alone.
+2. **GPU occupancy**: Workgroups may be too few to fill all GPU cores.
+   E.g., QKV: ceil(3456/64) × ceil(234/64) = 54 × 4 = 216 workgroups.
+   M3 has ~10 GPU cores, each running ~64 workgroups → 216 is only 34% occupancy.
+3. **Shader compilation**: First-run JIT compilation adds ~600ms (6040 vs 5443).
+4. **Memory latency**: Even bandwidth-bound, the actual throughput is lower
+   than theoretical 100 GB/s due to cache misses and access patterns.
+5. **Attention O(N²)**: 234² = 54,756 attention scores per head, 16 heads = 876K.
+   This is compute-heavy but the dot products are only 72-wide (small for GPU).
+
+**Weight breakdown** (per layer, Q8+F16):
+
+| Weight | Size | % of total |
+|--------|------|------------|
+| FFN down (F16) | 9.7 MB | 48% |
+| FFN up (Q8) | 5.1 MB | 25% |
+| QKV (Q8) | 4.1 MB | 20% |
+| AttnOut (Q8) | 1.4 MB | 7% |
+| LayerNorms | 0.02 MB | 0% |
+
+**What-if projections**:
+- F16 activations: 1.45× memory speedup (916→458 MB), but compute-bound → minimal
+- Q4 weights: 1.10× memory speedup (563→424 MB), but compute-bound → minimal
+- **Key insight**: Further weight/activation compression won't help much.
+  The bottleneck is COMPUTE, not memory. Need to improve compute throughput.
 
 ---
 
@@ -264,40 +304,62 @@ Already implemented before this session:
 
 ### P4: F16 storage for FFN down weights — DONE (see Completed Optimizations #5)
 
-### P4b: f16 storage for vision activations
+### P4b: f16 storage for vision activations — LOW PRIORITY (compute-bound)
 
 All activation buffers use f32 (4 bytes). Using f16 would halve memory
-bandwidth for activations. Apple Silicon has native f16 support (Metal).
-Requires `shader-f16` feature (already requested for FFN down). Vision tower
-activations can tolerate f16 precision (CLIP ViT models run successfully
-with f16 on WebGPU).
+bandwidth for activations (916→458 MB total). However, the benchmark shows
+the vision tower is **compute-bound** (60.3ms compute vs 14.8ms memory),
+so f16 activations would only give ~1.45× memory speedup but minimal actual
+speedup since compute is the bottleneck.
 
-**Note**: Weight bandwidth (22.1 MB/layer with Q8+F16) now closer to
-activation bandwidth (~9.4 MB/layer), so P4b is more impactful than before.
+**Revised priority**: LOW. Would help if we also improve compute throughput.
 
 ### P5: 2D tiled matmul for ffn_down (F16) — DONE (see Completed Optimizations #7)
 
 ### P6: 2D tiled matmul — DONE (see Completed Optimizations #6)
 
-### P5: 2D tiling for matmul
-
-Current matmul: 1 thread per output column, loops over K. Each workgroup
-(64 threads) handles 64 columns. For QKV (3456 outputs), that's 54 workgroups.
-
-2D tiling (from llama.cpp): each thread computes a 4×4 tile of outputs.
-TILE_M=4, TILE_N=4, WG_SIZE=8×8=64. This improves weight reuse and reduces
-workgroup count. Research shows 79.5% of optimal GFLOPs with this pattern.
-
-### P6: Subgroup operations (Chrome 134+)
+### P7: Subgroup operations (Chrome 134+) — HIGH PRIORITY (compute-bound)
 
 `subgroupAdd()`, `subgroupMax()` for softmax reductions. Eliminates shared
-memory and barriers. 1.29x prefill speedup in ONNX Runtime tests.
+memory and barriers. 1.29× prefill speedup in ONNX Runtime tests.
+
+**Why high priority now**: The benchmark shows we're 90× slower than the
+compute roofline. Subgroups would:
+1. Eliminate shared memory tiling in attention (direct global loads)
+2. Use `subgroupAdd` for dot product reduction (hardware-native)
+3. Reduce kernel launch overhead (fewer barriers = simpler shaders)
+4. Enable f16 compute (2× ALU throughput on Apple Silicon)
 
 **Status**: Chrome 134+ only. Not in Safari or Firefox yet. Must detect and
 fall back. Apple Silicon supports subgroups in Metal but Safari doesn't
 expose them in WebGPU yet.
 
-### P7: Create test images with known text content
+### P8: vec4 attention — DONE (see Completed Optimizations #8)
+
+### P9: Reduce kernel launch overhead — HIGH PRIORITY (90× gap)
+
+The 90× gap from roofline suggests kernel launch overhead is a major factor.
+27 layers × 7 dispatches/layer = 189 dispatches. Options:
+1. **Fuse dispatches**: Combine LayerNorm+QKV, or RoPE+attention, or
+   attn_out+residual into single dispatches (like the LLM engine's
+   fusedDecode option)
+2. **CUDA Graphs equivalent**: WebGPU doesn't have CUDA Graphs, but we can
+   reduce submit overhead by keeping everything in one compute pass (already
+   done) and minimizing pipeline state changes
+3. **Increase workgroup count**: More workgroups = better GPU occupancy =
+   more parallelism to hide launch latency
+
+### P10: F16 compute in attention — MEDIUM PRIORITY
+
+Apple Silicon has 2× f16 ALU throughput vs f32. Using f16 for the attention
+dot products and V accumulation would halve compute time. The LLM engine
+already does this (`matmul_split_sg_af16.wgsl` reads f16 activations,
+computes dot in f16, accumulates in f32).
+
+Requires `shader-f16` (already requested). Would need f16 activations (P4b)
+to get the data to the shader as f16.
+
+### P11: Create test images with known text content
 Create synthetic images with clear, large text to verify text recognition
 accuracy. This will help measure the impact of the bicubic fix and future
 accuracy improvements.
