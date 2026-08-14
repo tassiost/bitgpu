@@ -96,6 +96,30 @@ export interface Q8PackedWeight {
   K: number             // input features
 }
 
+/** An F16 weight tensor kept as raw f16 bytes for GPU f16 storage.
+ *  The shader reads array<f16> and widens to f32 at read time.
+ *  Weight bandwidth: 2 bytes/element vs 4 for f32 = 2x reduction. */
+export interface F16PackedWeight {
+  data: Uint16Array  // [N, K] f16 values (raw bytes reinterpreted)
+  N: number          // output features
+  K: number          // input features
+}
+
+/** Repack F16 raw bytes into a Uint16Array for GPU upload.
+ *  The GGUF F16 layout is already [N, K] row-major with 2-byte f16 values,
+ *  so we just need to reinterpret the bytes as Uint16Array. */
+export function repackF16(
+  data: Uint8Array, N: number, K: number,
+): F16PackedWeight {
+  // F16 data is already in the right layout — just reinterpret as Uint16Array
+  // Need to handle byteOffset alignment (Uint16Array requires 2-byte alignment)
+  const u16 = new Uint16Array(data.buffer, data.byteOffset, N * K)
+  // Copy to a fresh buffer to ensure alignment and ownership
+  const copy = new Uint16Array(N * K)
+  copy.set(u16)
+  return { data: copy, N, K }
+}
+
 /** Convert IEEE 754 half-precision (f16) bits to f32. */
 function f16ToF32(bits: number): number {
   const sign = (bits >> 15) & 1
@@ -283,7 +307,7 @@ async function readTensorBytes(
 }
 
 /** Load and dequantize a single tensor from the mmproj file.
- *  For Q8_0 tensors, also returns the raw bytes and type for GPU repacking. */
+ *  For Q8_0 and F16 tensors, also returns the raw bytes and type for GPU repacking. */
 async function loadTensor(
   url: string,
   tensor: GgufTensor,
@@ -304,7 +328,8 @@ async function loadTensor(
       break
     case GGUF_F16:
       data = dequantF16(raw, 1, elems)
-      break
+      // Keep raw bytes for GPU f16 storage (avoids re-fetching)
+      return { name: tensor.name, data, dims, raw, type: GGUF_F16 }
     case GGUF_Q8_0: {
       // GGUF dims for Q8_0: [ne0, ne1] where ne0 is the innermost (fastest) dim.
       // For a weight matrix, ne0 = in_features, ne1 = out_features.
@@ -346,6 +371,8 @@ export interface VisionWeights {
   mergerMm2Bias: Float32Array    // [5120]
   // Q8 packed weights for GPU in-shader dequantization (null if not Q8_0)
   q8: VisionQ8Weights | null
+  // F16 packed weights for GPU f16 storage (null if not F16)
+  f16: VisionF16Weights | null
 }
 
 interface VisionLayerWeights {
@@ -375,7 +402,17 @@ interface Q8LayerWeights {
   qkv: Q8PackedWeight       // [3456, 1152]
   attnOut: Q8PackedWeight   // [1152, 1152]
   ffnUp: Q8PackedWeight     // [4304, 1152]
-  // ffnDown is F16, not Q8_0 — no packed version
+  // ffnDown is F16, not Q8_0 — stored in VisionF16Weights
+}
+
+/** F16 packed weights for GPU f16 storage (widened to f32 at read in shader).
+ *  Each field is null if the weight is not F16. */
+export interface VisionF16Weights {
+  layers: F16LayerWeights[]
+}
+
+interface F16LayerWeights {
+  ffnDown: F16PackedWeight  // [1152, 4304]
 }
 
 /** Load all vision tower weights from the mmproj GGUF file.
@@ -470,6 +507,7 @@ export async function loadVisionWeights(
   // Per-layer weights
   const layers: VisionLayerWeights[] = []
   const q8Layers: Q8LayerWeights[] = []
+  const f16Layers: F16LayerWeights[] = []
   for (let li = 0; li < depth; li++) {
     const ln1W = await get(`v.blk.${li}.ln1.weight`)
     const ln1B = await get(`v.blk.${li}.ln1.bias`)
@@ -522,6 +560,16 @@ export async function loadVisionWeights(
       attnOut: repackQ8_0(attnOutW.raw!, attnN, attnK),
       ffnUp: repackQ8_0(ffnUpW.raw!, ffnUpN, ffnUpK),
     })
+
+    // Repack F16 weights for GPU f16 storage (ffn_down is F16)
+    if (ffnDownW.type === GGUF_F16 && ffnDownW.raw) {
+      const d = ffnDownW.dims
+      const ffnDownN = d.length >= 2 ? d[1] : 1  // out=1152
+      const ffnDownK = d[0]                        // in=4304
+      f16Layers.push({
+        ffnDown: repackF16(ffnDownW.raw, ffnDownN, ffnDownK),
+      })
+    }
   }
 
   // Patch merger
@@ -555,6 +603,7 @@ export async function loadVisionWeights(
     mergerMm2Weight: mm2W.data,  // [5120, 4608]
     mergerMm2Bias: mm2B.data,
     q8: { layers: q8Layers, mergerMm0: q8Mm0, mergerMm2: q8Mm2 },
+    f16: { layers: f16Layers },
   }
 
   return { weights, config }

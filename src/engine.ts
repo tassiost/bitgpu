@@ -363,7 +363,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const fusedQKV = !!opts.fusedQKV && useSG && kv8 && !actF16 && !fusedDec
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
-  if (kv16 || actF16) features.push('shader-f16' as GPUFeatureName)
+  // Request shader-f16 for vision tower f16 weight storage (ffn_down) if available.
+  // Also used by kv16/actF16 LLM paths. Falls back to f32 if not supported.
+  const hasF16 = adapter.features.has('shader-f16' as GPUFeatureName)
+  if (kv16 || actF16 || hasF16) features.push('shader-f16' as GPUFeatureName)
   // timestamp-query: purely diagnostic (true GPU-side kernel timing for the dev profiler). Requested
   // whenever the adapter offers it; it never changes decode behavior and shipping paths never use it.
   const hasTS = adapter.features.has('timestamp-query' as GPUFeatureName)
@@ -541,7 +544,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // All vision shaders use fixed @workgroup_size — no overrides needed
     for (const n of ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
                       'vision_matmul_tiled_add', 'vision_matmul_q8', 'vision_matmul_q8_gelu',
-                      'vision_matmul_q8_add', 'vision_layernorm', 'vision_gelu', 'vision_add',
+                      'vision_matmul_q8_add', 'vision_matmul_f16_add',
+                      'vision_layernorm', 'vision_gelu', 'vision_add',
                       'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
                       'vision_apply_rope', 'vision_inject'])
       specs.push([n])
@@ -3405,6 +3409,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           device.queue.writeBuffer(sBuf, 0, pw.scales.buffer, pw.scales.byteOffset, pw.scales.byteLength)
           return { packed: pBuf, scales: sBuf }
         }
+        // Upload f16 weight (raw Uint16Array bytes)
+        const upF16 = (pw: { data: Uint16Array }): GPUBuffer => {
+          const b = device.createBuffer({ size: pw.data.byteLength, usage: S_ | CD | CS })
+          device.queue.writeBuffer(b, 0, pw.data.buffer, pw.data.byteOffset, pw.data.byteLength)
+          return b
+        }
         const vb = visionState!.buffers
         vb.set('patchEmbdWeight', up(vw.patchEmbdWeight))
         vb.set('patchEmbdWeightCompact', up(vw.patchEmbdWeightCompact))
@@ -3458,7 +3468,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           vb.set(p + 'ln2W', up(lw.ln2Weight))
           vb.set(p + 'ln2B', up(lw.ln2Bias))
           vb.set(p + 'ffnUpB', up(lw.ffnUpBias))
-          vb.set(p + 'ffnDownW', up(lw.ffnDownWeight))
+          // FFN down: upload as f16 if available, else f32
+          if (vw.f16 && vw.f16.layers[li]?.ffnDown) {
+            vb.set(p + 'ffnDownWF16', upF16(vw.f16.layers[li].ffnDown))
+          } else {
+            vb.set(p + 'ffnDownW', up(lw.ffnDownWeight))
+          }
           vb.set(p + 'ffnDownB', up(lw.ffnDownBias))
         }
         // Upload merger Q8 weights
@@ -3670,12 +3685,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         }
         pass.dispatchWorkgroups(Math.ceil(inter / 64))
 
-        // 7. FFN down + residual add (FUSED: 1 dispatch, was 2)
+        // 7. FFN down + residual add — f16 weight if available, else f32
         //    h0 = h1 + matmul(act, ffnDownW, ffnDownB)
-        setup(pass, 'vision_matmul_tiled_add',
-          [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
-          [actBuf_, vw.get(p + 'ffnDownW')!, vw.get(p + 'ffnDownB')!],
-          [h0, h1])  // out=h0, residual=h1
+        if (vw.get(p + 'ffnDownWF16')) {
+          setup(pass, 'vision_matmul_f16_add',
+            [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [actBuf_, vw.get(p + 'ffnDownWF16')!, vw.get(p + 'ffnDownB')!],
+            [h0, h1])
+        } else {
+          setup(pass, 'vision_matmul_tiled_add',
+            [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [actBuf_, vw.get(p + 'ffnDownW')!, vw.get(p + 'ffnDownB')!],
+            [h0, h1])
+        }
         pass.dispatchWorkgroups(Math.ceil(H / 64))
 
         // After this layer: h0 = current hidden states, h1 = scratch
