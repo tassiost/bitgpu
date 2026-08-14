@@ -146,7 +146,29 @@ This follows the LLM engine's f16 KV cache pattern (`attention_sg_kv16.wgsl`).
 **Results**: Accuracy preserved. Bandwidth reduced 1.45× further on top of Q8.
 Combined with Q8: total weight bandwidth 60.8 MB → 22.1 MB per layer (2.75× reduction).
 
-### 6. Previous optimizations (commit e177133)
+### 6. 2D tiled Q8 matmul (P6 — COMPUTE INTENSITY)
+
+**Problem**: The 1D Q8 matmul read W from global memory for every M iteration
+(234× redundant for 234 patches). Each thread read its own W row from global
+memory in the inner K loop, with no reuse across patches.
+
+**Fix**: 2D tiled register-blocked matmul (BM=64, BN=64, BK=16) with 4×4
+register tiles per thread, 256 threads per workgroup. Both X and W tiles are
+loaded into shared memory (8KB total), so W is read from global memory only
+K/16 times and reused across 64 patches per tile.
+
+Pattern follows the LLM engine's `matmul_split_tiled.wgsl`:
+- 256 threads arranged as 16×16 grid
+- Each thread computes a 4×4 output tile in registers
+- Q8 dequantization happens during cooperative W tile load
+- vec4 dot products for the accumulation loop
+
+**Files**: `shaders/vision_matmul_q8_tiled.wgsl`, `vision_matmul_q8_tiled_gelu.wgsl`, `vision_matmul_q8_tiled_add.wgsl` (new), `src/engine.ts` (2D dispatch)
+
+**Results**: Vision tower 31.1s → 26.9s (13% faster). Accuracy preserved.
+Combined with Q8+F16: 33.9s → 26.9s (20.6% total improvement).
+
+### 7. Previous optimizations (commit e177133)
 
 Already implemented before this session:
 1. Compact patch embedding for still images (sum temporal weights → 768-dim)
@@ -212,12 +234,21 @@ Already implemented before this session:
 
 All activation buffers use f32 (4 bytes). Using f16 would halve memory
 bandwidth for activations. Apple Silicon has native f16 support (Metal).
-Requires `shader-f16` feature. Vision tower activations can tolerate f16
-precision (CLIP ViT models run successfully with f16 on WebGPU).
+Requires `shader-f16` feature (already requested for FFN down). Vision tower
+activations can tolerate f16 precision (CLIP ViT models run successfully
+with f16 on WebGPU).
 
-**Note**: Weight bandwidth (32.0 MB/layer with Q8) still dominates activation
-bandwidth (~9.4 MB/layer), so P4 (f16 FFN down) is more impactful than P4b
-(f16 activations). Doing both would be ideal.
+**Note**: Weight bandwidth (22.1 MB/layer with Q8+F16) now closer to
+activation bandwidth (~9.4 MB/layer), so P4b is more impactful than before.
+
+### P5: 2D tiled matmul for ffn_down (F16)
+
+The ffn_down matmul still uses the 1D tiled pattern (vision_matmul_f16_add).
+Applying 2D tiling (like the Q8 shaders) would eliminate redundant W reads
+across M iterations. The f16 weight would be loaded into shared memory as
+f16 and widened to f32 during the dot product.
+
+### P6: 2D tiled matmul — DONE (see Completed Optimizations #6)
 
 ### P5: 2D tiling for matmul
 
@@ -332,3 +363,15 @@ barrier overhead can exceed the saved memory traffic.
 - Combined with Q8: total weight bandwidth 60.8 MB → 22.1 MB/layer (2.75× reduction)
 - Pattern: Follows LLM engine's f16 KV cache (attention_sg_kv16.wgsl) —
   array<f16> storage, f32() widening at read time
+
+### 2025-01-XX: 2D tiled Q8 matmul
+- Status: COMPLETE
+- Files changed:
+  - `shaders/vision_matmul_q8_tiled.wgsl` (new — 2D tiled Q8 with split outputs)
+  - `shaders/vision_matmul_q8_tiled_gelu.wgsl` (new — 2D tiled Q8 + GELU)
+  - `shaders/vision_matmul_q8_tiled_add.wgsl` (new — 2D tiled Q8 + residual add)
+  - `src/engine.ts` (2D dispatch: ceil(N/64) × ceil(M/64))
+- Results: Vision tower 31.1s → 26.9s (13% faster). Accuracy preserved.
+- Combined with Q8+F16: 33.9s → 26.9s (20.6% total improvement)
+- Pattern: Follows LLM engine's matmul_split_tiled.wgsl —
+  BM=64, BN=64, BK=16, 256 threads, 4×4 register tiles, 8KB shared memory
