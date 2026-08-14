@@ -20,7 +20,7 @@ Bonsai-27B (Qwen3-VL) vision tower implementation in bitgpu.
 
 | Metric | Baseline | After opt | Improvement |
 |--------|----------|-----------|-------------|
-| Vision tower | 50.8s | 33.9s | 33% faster |
+| Vision tower | 50.8s | 8.7s | 83% faster |
 | Prefill | 18.2s | 11.5s | 37% faster |
 | Tokens/s | 3.6 | 5.7 | 58% faster |
 
@@ -39,11 +39,11 @@ The bicubic interpolation fix (a=-0.75 → a=-0.5) may improve this further
 with more test images.
 
 **Bandwidth analysis**: The vision tower is memory-bandwidth bound, not
-compute bound. Total weight reads per layer: 55.5 MB (f32). At ~100 GB/s
-(M3 unified memory), theoretical minimum is ~15ms/layer, but actual is
-~1260ms/layer — 84× slower. The weights are dequantized from Q8_0 to f32
-on CPU, then uploaded as f32 buffers. Keeping them as Q8_0 and dequantizing
-in-shader would reduce weight bandwidth 4× (P3 below).
+compute bound. After Q8+F16 weight optimization, total weight reads per
+layer: 22.1 MB (was 60.8 MB f32). At ~100 GB/s (M3 unified memory),
+theoretical minimum is ~5.5ms/layer. With 2D tiling + vec4 attention,
+actual is ~320ms/layer — 58× gap (was 84×). Remaining gap is from
+activation bandwidth, attention O(N²) compute, and kernel launch overhead.
 
 ---
 
@@ -183,7 +183,26 @@ the cooperative W tile load into shared memory.
 **Results**: Vision tower 26.9s → 12.2s (55% faster). Accuracy preserved.
 Combined Q8+F16+2D tiling: 33.9s → 12.2s (64% total improvement).
 
-### 8. Previous optimizations (commit e177133)
+### 8. vec4 dot products in attention (P8 — COMPUTE OPTIMIZATION)
+
+**Problem**: The vision attention shader iterated head_dim=72 one element at
+a time for Q·K dot product, V accumulation, Q/K/V load, and output write.
+72 scalar operations per inner loop iteration.
+
+**Fix**: Since head_dim=72 = 4×18, all loops use vec4 operations:
+- Q·K dot product: 72 scalar mul-adds → 18 vec4 dots
+- V accumulation: 72 scalar mul-adds → 18 vec4 mul-adds
+- Q/K/V load: 72 scalar loads → 18 vec4 loads
+- Output write: 72 scalar writes → 18 vec4 writes
+
+Shared memory tiles stored as `array<vec4<f32>>` instead of `array<f32>`.
+
+**Files**: `shaders/vision_attention.wgsl` (rewritten with vec4)
+
+**Results**: Vision tower 12.2s → 8.7s (29% faster). Accuracy preserved.
+Combined Q8+F16+2D tiling+vec4 attention: 33.9s → 8.7s (74% total improvement).
+
+### 9. Previous optimizations (commit e177133)
 
 Already implemented before this session:
 1. Compact patch embedding for still images (sum temporal weights → 768-dim)
@@ -395,3 +414,12 @@ barrier overhead can exceed the saved memory traffic.
 - Combined Q8+F16+2D tiling: 33.9s → 12.2s (64% total improvement)
 - Pattern: Combines 2D tiling (matmul_split_tiled) with f16 storage
   (attention_sg_kv16) — f16 weights widened to f32 during cooperative W tile load
+
+### 2025-01-XX: vec4 dot products in attention
+- Status: COMPLETE
+- Files changed:
+  - `shaders/vision_attention.wgsl` (rewritten with vec4 for all head_dim loops)
+- Results: Vision tower 12.2s → 8.7s (29% faster). Accuracy preserved.
+- Combined Q8+F16+2D tiling+vec4 attention: 33.9s → 8.7s (74% total improvement)
+- Pattern: head_dim=72=4×18, all loops use vec4 dot/mul-add/load/write.
+  Shared memory tiles stored as array<vec4<f32>>.
