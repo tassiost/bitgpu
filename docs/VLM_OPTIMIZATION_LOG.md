@@ -119,7 +119,34 @@ Improvement limited because ffn_down (biggest weight, 19.8 MB) is F16 not
 Q8_0 — still uploaded as f32. Keeping it as f16 on GPU would add another
 ~2× on that weight (P4 below).
 
-### 5. Previous optimizations (commit e177133)
+### 5. F16 storage for FFN down weights (P4 — WEIGHT BANDWIDTH)
+
+**Problem**: FFN down is the largest vision weight (19.8 MB/layer, [1152, 4304])
+and is stored as F16 in the GGUF file. It was converted to f32 on CPU and
+uploaded as f32, wasting 2× bandwidth on the largest weight.
+
+**Fix**: Keep FFN down as f16 on GPU. New `vision_matmul_f16_add.wgsl` shader
+uses `enable f16;` and reads `array<f16>` weights, widening to f32 at read:
+```wgsl
+acc = acc + shared_x[k] * f32(w[w_base + kt + k]);
+```
+This follows the LLM engine's f16 KV cache pattern (`attention_sg_kv16.wgsl`).
+
+**Weight bandwidth reduction**:
+| Weight | Before | After | Reduction |
+|--------|--------|-------|-----------|
+| QKV (Q8) | 5.0 MB | 5.0 MB | — |
+| attn_out (Q8) | 1.4 MB | 1.4 MB | — |
+| ffn_up (Q8) | 5.8 MB | 5.8 MB | — |
+| ffn_down (F16) | 19.8 MB (f32) | 9.9 MB (f16) | 2× |
+| **Total per layer** | **32.0 MB** | **22.1 MB** | **1.45×** |
+
+**Files**: `src/vision.ts` (repackF16, F16PackedWeight), `shaders/vision_matmul_f16_add.wgsl` (new), `src/engine.ts` (shader-f16 request, f16 upload, f16 shader dispatch)
+
+**Results**: Accuracy preserved. Bandwidth reduced 1.45× further on top of Q8.
+Combined with Q8: total weight bandwidth 60.8 MB → 22.1 MB per layer (2.75× reduction).
+
+### 6. Previous optimizations (commit e177133)
 
 Already implemented before this session:
 1. Compact patch embedding for still images (sum temporal weights → 768-dim)
@@ -179,19 +206,7 @@ Already implemented before this session:
 
 ### P3: Q8_0 in-shader dequantization — DONE (see Completed Optimizations #4)
 
-### P4: F16 storage for FFN down weights (NEXT BIGGEST WIN)
-
-FFN down is the largest vision weight (19.8 MB/layer, [1152, 4304]) and is
-stored as F16 in the GGUF file. Currently it's converted to f32 on CPU and
-uploaded as f32. Keeping it as f16 on GPU would:
-- Reduce weight bandwidth: 19.8 MB → 9.9 MB per layer (2× reduction)
-- Total weight bandwidth: 32.0 MB → 22.1 MB per layer (1.45× further reduction)
-- Requires `shader-f16` feature (Apple Silicon supports it natively)
-- The LLM engine already uses f16 storage for KV cache (attention_sg_kv16.wgsl)
-
-**Challenge**: Need a new `vision_matmul_f16_add.wgsl` shader that reads
-`array<f16>` weights. The `enable f16;` directive and `shader-f16` feature
-are needed. Fall back to f32 if the adapter doesn't support f16.
+### P4: F16 storage for FFN down weights — DONE (see Completed Optimizations #5)
 
 ### P4b: f16 storage for vision activations
 
@@ -306,3 +321,14 @@ barrier overhead can exceed the saved memory traffic.
 - Weight bandwidth: 60.8 MB/layer → 32.0 MB/layer (1.9× reduction)
 - Pattern: Follows LLM engine's q8 KV cache (attention_sg_kv8.wgsl) —
   packed u32 words + f32 block scales, dequantized inline via bit shifts
+
+### 2025-01-XX: F16 storage for FFN down weights
+- Status: COMPLETE
+- Files changed:
+  - `src/vision.ts` (repackF16(), F16PackedWeight type, F16 packed weight loading)
+  - `shaders/vision_matmul_f16_add.wgsl` (new — f16 weight matmul + residual add)
+  - `src/engine.ts` (request shader-f16, f16 buffer upload, f16 shader dispatch)
+- Results: Accuracy preserved. Weight bandwidth 32.0 MB → 22.1 MB/layer (1.45× further)
+- Combined with Q8: total weight bandwidth 60.8 MB → 22.1 MB/layer (2.75× reduction)
+- Pattern: Follows LLM engine's f16 KV cache (attention_sg_kv16.wgsl) —
+  array<f16> storage, f32() widening at read time
