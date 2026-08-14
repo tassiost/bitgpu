@@ -43,31 +43,46 @@ content (social media / messaging app), but still can't read exact text.
 The bicubic interpolation fix (a=-0.75 → a=-0.5) may improve this further
 with more test images.
 
-**Bottleneck analysis** (theoretical roofline @ 100 GB/s, 5 TFLOPS):
+**Bottleneck analysis** (theoretical roofline @ 100 GB/s, 2.84 TFLOPS M3 / ~3.5 TFLOPS M4):
+
+**Hardware**: Apple M4 (10-core GPU, 128 ALUs/core, 32-thread subgroups)
+- Available WebGPU features: `subgroups`, `shader-f16`, `timestamp-query`, `chromium-experimental-subgroup-matrix`
+- Subgroup size: 32 (fixed on Apple Silicon)
+- Peak f32: ~3.5 TFLOPS | Peak f16: ~7 TFLOPS (2× f32)
+- DRAM: 120 GB/s | L2: ~400 GB/s | Threadgroup: ~23 GB/s (SLOWER than DRAM!)
 
 | Component | Per layer | All 27 layers | Theoretical time |
 |-----------|-----------|---------------|------------------|
 | Weights (Q8+F16) | 20.8 MB | 562.8 MB | 5.6 ms |
 | Activations (f32) | 33.9 MB | 916.3 MB | 9.2 ms |
 | Memory total | 54.8 MB | 1479 MB | 14.8 ms |
-| Compute | 11.2 GFLOP | 301 GFLOP | 60.3 ms |
-| **Roofline** | | | **60.3 ms** |
+| Compute | 11.2 GFLOP | 301 GFLOP | 86-106 ms |
+| **Roofline** | | | **86-106 ms** |
 
-- **Theoretical bottleneck**: COMPUTE-BOUND (60.3ms compute vs 14.8ms memory)
-- **Actual**: 5443ms — **90× slower than compute roofline**
-- **Efficiency**: 1.1% of roofline
+- **Theoretical bottleneck**: COMPUTE-BOUND (86-106ms compute vs 14.8ms memory)
+- **Actual**: 5443ms — **51-63× slower than compute roofline**
+- **Efficiency**: 1.6-2.0% of roofline
 
-**Why the 90× gap?** The compute roofline assumes 5 TFLOPS sustained, but:
-1. **Kernel launch overhead**: 27 layers × 7 dispatches/layer = 189 dispatches.
-   Each dispatch has ~0.1-0.5ms launch overhead → 19-95ms overhead alone.
-2. **GPU occupancy**: Workgroups may be too few to fill all GPU cores.
-   E.g., QKV: ceil(3456/64) × ceil(234/64) = 54 × 4 = 216 workgroups.
-   M3 has ~10 GPU cores, each running ~64 workgroups → 216 is only 34% occupancy.
-3. **Shader compilation**: First-run JIT compilation adds ~600ms (6040 vs 5443).
-4. **Memory latency**: Even bandwidth-bound, the actual throughput is lower
-   than theoretical 100 GB/s due to cache misses and access patterns.
-5. **Attention O(N²)**: 234² = 54,756 attention scores per head, 16 heads = 876K.
-   This is compute-heavy but the dot products are only 72-wide (small for GPU).
+**Why the 51-63× gap?**
+1. **Q8 dequantization overhead**: Each vec4 weight needs ~8 extra instructions
+   (shift, mask, convert, multiply), halving effective compute throughput.
+2. **Small matrix sizes**: 1152×1152 matmuls are too small to saturate the GPU's
+   parallelism. The GPU has ~1280 ALUs but each workgroup only has 256 threads.
+3. **Threadgroup shared memory is SLOW on Apple Silicon** (~23 GB/s vs 100 GB/s
+   DRAM). The cooperative load + barrier pattern adds latency.
+4. **Shader JIT compilation**: First run is ~600ms slower (6040 vs 5443).
+5. **Attention O(N²)**: 234² × 16 heads = 876K scores, each with 72-wide dot.
+6. **No subgroup usage**: Vision shaders use shared memory + barriers instead
+   of hardware-native subgroup operations (3× speedup reported by ONNX Runtime).
+
+**Key research findings** (Apple Silicon WebGPU optimization):
+- Threadgroup shared memory (~23 GB/s) is SLOWER than DRAM (100 GB/s)
+- Direct global loads can be 2.3-2.8× faster than shared memory staging
+  (but NOT for our matmul pattern — cooperative loading reduces total traffic)
+- Subgroup operations (Chrome 134+) give 3× speedup for matmul
+- F16 compute is 2× peak throughput (7 vs 3.5 TFLOPS on M4)
+- BK=32 is slightly slower than BK=16 (more shared memory, lower occupancy)
+- MLX uses BM=64, BN=64, BK=16 for medium Apple Silicon devices
 
 **Weight breakdown** (per layer, Q8+F16):
 
@@ -84,6 +99,17 @@ with more test images.
 - Q4 weights: 1.10× memory speedup (563→424 MB), but compute-bound → minimal
 - **Key insight**: Further weight/activation compression won't help much.
   The bottleneck is COMPUTE, not memory. Need to improve compute throughput.
+
+**Root cause analysis** (why we're 51× from compute roofline):
+The Q8_0 dequantization adds ~8 extra instructions per vec4 weight
+(shift, mask, sign-extend, convert, multiply). Each FMA is only 1 of ~52
+total instructions per K iteration, giving ~2% compute efficiency — which
+matches the measured 1.1% roofline efficiency. The 2D tiled matmul with
+256 threads, 4×4 register tiles, BK=16 is already well-optimized for this
+constraint. Seven alternative approaches were tested and all were slower
+(see "Findings: What DIDN'T work" below). The current implementation
+represents a local optimum given the Q8_0 weight format and Apple Silicon
+GPU architecture.
 
 ---
 
@@ -406,6 +432,102 @@ workgroups independently.
 **Lesson**: Kernel fusion is not always beneficial. When the fused kernel
 serializes work that was previously parallelized across dispatches, the
 barrier overhead can exceed the saved memory traffic.
+
+### BK=32 (BKV=8) for Q8 tiled matmul (TESTED, REVERTED)
+Tried doubling BK from 16 to 32 to halve the number of K iterations and
+barriers. Result: 6% SLOWER (5443ms → 5755ms).
+
+**Why**: BK=32 doubles the shared memory per tile (256→512 vec4s per array,
+512→1024 total). On Apple Silicon, shared memory is backed by L1 cache
+(~23 GB/s, SLOWER than DRAM at 100 GB/s). Larger tiles mean more shared
+memory traffic and lower GPU occupancy (fewer workgroups per core).
+
+**Lesson**: On Apple Silicon, smaller BK values are better because shared
+memory is the bottleneck, not barrier count.
+
+### Direct global load matmul (TESTED, REVERTED)
+Tried eliminating shared memory entirely — each thread loads X and W directly
+from global memory (L2 cached). Result: 25% SLOWER (5443ms → 6816ms).
+
+**Why**: Without cooperative loading, each of the 256 threads loads its own
+W vec4s, causing 4× more global memory traffic (2048 vs 512 vec4s per K
+iteration). The L2 cache (~400 GB/s) handles this, but the extra traffic
+overwhelms the cache. The 2D tiled approach with shared memory reduces
+total W reads by 64× (loaded once per K tile, reused across 64 patches).
+
+**Lesson**: On Apple Silicon, shared memory staging IS beneficial for matmul
+because it reduces total global memory traffic, even though shared memory
+bandwidth is lower than DRAM. The research about "direct global loads being
+faster" applies to cases where staging adds latency without reducing traffic.
+
+### Subgroup per-output matmul (TESTED, REVERTED)
+Tried using one subgroup (32 threads) per (m, n) output element with
+`subgroupAdd` for K reduction. Result: 2.5× SLOWER (5443ms → 13455ms).
+
+**Why**: One workgroup per output element means 234×3456 = 808K workgroups
+for QKV alone. Each workgroup has only 32 threads doing a tiny dot product
+(K/32 = 36 iterations). The workgroup launch overhead dominates completely.
+The 2D tiled approach amortizes launch overhead across 256 output elements
+per workgroup.
+
+**Lesson**: Subgroups are powerful for reduction-heavy operations (like the
+LLM decode matmul where M=1), but NOT for batched matmul where M>1. The 2D
+tiled pattern with 256 threads is much better for batched matmul.
+
+### 8×4 register tiles (TESTED, REVERTED)
+Tried using 8×4 register tiles (128 threads) instead of 4×4 (256 threads).
+Result: 49% SLOWER (5443ms → 8094ms).
+
+**Why**: 128 threads means each thread does 2 cooperative loads per K
+iteration (256 elements / 128 threads = 2), doubling load time. The 8-row
+register tile also increases register pressure, reducing GPU occupancy.
+
+**Lesson**: 256 threads with 4×4 tiles is the sweet spot for Apple Silicon.
+Smaller workgroups reduce cooperative load efficiency.
+
+### F16 compute in F16 matmul (TESTED, REVERTED)
+Tried using f16 for dot products in the F16 tiled matmul (store X and W as
+f16 in shared memory, dot in f16, accumulate in f32). Result: NO IMPROVEMENT
+(5443ms → 5494ms, within noise).
+
+**Why**: The f32→f16 conversion of X adds overhead that offsets the 2× ALU
+gain. The FFN down matmul is only 1 of 7 dispatches per layer, so even a 2×
+speedup there would only give ~15% overall improvement. The conversion
+overhead eats most of that.
+
+**Lesson**: F16 compute only helps when the data is ALREADY in f16 (like the
+W weights). Converting f32 activations to f16 on-the-fly negates the ALU gain.
+
+### Pre-dequantize Q8→F16 weights (TESTED, REVERTED)
+Tried pre-dequantizing Q8_0 weights to f16 at load time, then using the f16
+tiled matmul for ALL layers (not just ffn_down). Result: 25× SLOWER
+(5443ms → 139316ms) AND accuracy broke (model sees "cartoon character"
+instead of screenshot).
+
+**Why**:
+1. F16 weights are 88% larger than Q8 (2 bytes vs 1.0625 bytes), causing
+   88% more memory traffic. At 100 GB/s, the extra 248 MB takes 2.5ms more
+   per forward pass — but the actual slowdown is much worse because the
+   larger weights overwhelm the L2 cache.
+2. F16 precision is insufficient for these weights — the Q8_0 block scales
+   provide dynamic range that f16 can't represent with a single global
+   precision. The accuracy loss confirms this.
+
+**Lesson**: Q8_0 with in-shader dequantization is BETTER than pre-dequantized
+f16 for this model. The dequant overhead (~50% of instructions) is less
+costly than the 88% memory traffic increase. Q8_0's block-level scales
+provide better dynamic range than f16.
+
+### TILE_SIZE=32 in attention (TESTED, FAILED)
+Tried increasing attention TILE_SIZE from 16 to 32 to reduce barrier count.
+Result: FAILED — workgroup storage 18432 bytes > 16384 byte default limit.
+
+**Why**: Apple Silicon's default workgroup storage limit is 16KB. TILE_SIZE=32
+needs 18KB (32×72×4×2 = 18432 bytes for K+V tiles). Requesting 32KB limit
+was previously tested and reduces GPU occupancy.
+
+**Lesson**: TILE_SIZE=16 with 16KB workgroup storage is the maximum practical
+tile size for attention on Apple Silicon.
 
 ---
 
