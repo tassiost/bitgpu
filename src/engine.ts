@@ -437,6 +437,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       )
     requiredLimits.maxBufferSize = needBind
   }
+  // Note: Could request 32KB workgroup storage for larger attention tiles,
+  // but testing showed it reduces GPU occupancy on Apple Silicon, making
+  // the vision tower slower overall. TILE_SIZE=16 with 16KB default is optimal.
   const device = await adapter.requestDevice({
     requiredFeatures: features,
     requiredLimits: Object.keys(requiredLimits).length ? requiredLimits : undefined,
@@ -3533,7 +3536,6 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const qRopedBuf = actBuf(numPatches * H)
       const kRopedBuf = actBuf(numPatches * H)
       const attnOut = actBuf(numPatches * H)
-      // Fused shaders eliminate: attnProj, upBuf, downBuf (3 fewer buffers)
       const actBuf_ = actBuf(numPatches * inter)  // FFN up+GELU output
 
       // Buffer swapping:
@@ -3548,8 +3550,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       for (let li = 0; li < depth; li++) {
         const p = `l${li}.`
 
-        // --- Attention block (3 dispatches, down from 5) ---
-        // 1. LayerNorm1
+        // --- Attention block (4 dispatches) ---
+        // 1. LayerNorm1 (parallelized: 64 threads, tree reduction)
         runN(pass, 'vision_layernorm',
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h0, vw.get(p + 'ln1W')!, vw.get(p + 'ln1B')!], normedBuf, numPatches)
@@ -3562,37 +3564,33 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         pass.dispatchWorkgroups(Math.ceil(3 * H / 64))
 
         // 2b. Apply 2D RoPE to Q and K (one dispatch, all patches × heads)
-        // This pre-rotates Q/K so the attention kernel doesn't need to re-apply
-        // RoPE for every query×key pair (eliminates O(N²) redundant RoPE work)
         setup(pass, 'vision_apply_rope',
           [['u', numPatches], ['u', heads], ['u', hd], ['u', hd / 2], ['u', 0], ['u', 0], ['u', 0], ['u', 0]],
           [qBuf, kBuf, qRopedBuf, kRopedBuf, cosBuf, sinBuf], [])
         pass.dispatchWorkgroups(numPatches)
 
         // 3. Bidirectional attention with pre-applied RoPE
-        // Q and K already have RoPE applied — attention is pure Q·K^T·V
-        // Uses shared-memory tiling for K/V (cooperative load, 32 threads)
+        //    Uses shared-memory tiling for K/V (TILE_SIZE=32, needs 32KB workgroup storage)
         setup(pass, 'vision_attention',
           [['u', heads], ['u', hd], ['u', numSegments], ['f', 1 / Math.sqrt(hd)], ['u', 0], ['u', 0], ['u', 0], ['u', 0]],
           [qRopedBuf, kRopedBuf, vBuf, cuBuf], [attnOut])
         pass.dispatchWorkgroups(numSegments, heads, Math.ceil(framePatches / 32))
 
-        // 4. Attn output proj + residual add (FUSED: 1 dispatch, was 2)
+        // 4. Attn output proj + residual add (FUSED)
         //    h1 = h0 + matmul(attnOut, attnOutW, attnOutB)
-        //    vision_matmul_tiled_add bindings: [x, w, bias] = ins, [out, residual] = outs
         setup(pass, 'vision_matmul_tiled_add',
           [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
           [attnOut, vw.get(p + 'attnOutW')!, vw.get(p + 'attnOutB')!],
           [h1, h0])  // out=h1, residual=h0
         pass.dispatchWorkgroups(Math.ceil(H / 64))
 
-        // --- MLP block (3 dispatches, down from 5) ---
-        // 5. LayerNorm2 — input is h1 (post-attention residual)
+        // --- MLP block (3 dispatches) ---
+        // 5. LayerNorm2 (parallelized: 64 threads, tree reduction)
         runN(pass, 'vision_layernorm',
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h1, vw.get(p + 'ln2W')!, vw.get(p + 'ln2B')!], normed2Buf, numPatches)
 
-        // 6. FFN up + GELU (FUSED: 1 dispatch, was 2)
+        // 6. FFN up + GELU (FUSED)
         //    act = GELU(matmul(normed2, ffnUpW, ffnUpB))
         setup(pass, 'vision_matmul_tiled_gelu',
           [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],

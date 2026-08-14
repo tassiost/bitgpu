@@ -16,7 +16,7 @@ Bonsai-27B (Qwen3-VL) vision tower implementation in bitgpu.
 - LayerNorm (not RMSNorm) with eps=1e-6
 - No window attention (confirmed: Qwen3-VL removed this, unlike Qwen2.5-VL)
 
-**Performance results** (234-patch screenshot, M3 Mac):
+**Performance results** (234-patch screenshot, M3 Mac, cold system):
 
 | Metric | Baseline | After opt | Improvement |
 |--------|----------|-----------|-------------|
@@ -37,6 +37,13 @@ Bonsai-27B (Qwen3-VL) vision tower implementation in bitgpu.
 content (social media / messaging app), but still can't read exact text.
 The bicubic interpolation fix (a=-0.75 → a=-0.5) may improve this further
 with more test images.
+
+**Bandwidth analysis**: The vision tower is memory-bandwidth bound, not
+compute bound. Total weight reads per layer: 55.5 MB (f32). At ~100 GB/s
+(M3 unified memory), theoretical minimum is ~15ms/layer, but actual is
+~1260ms/layer — 84× slower. The weights are dequantized from Q8_0 to f32
+on CPU, then uploaded as f32 buffers. Keeping them as Q8_0 and dequantizing
+in-shader would reduce weight bandwidth 4× (P3 below).
 
 ---
 
@@ -125,35 +132,115 @@ Already implemented before this session:
 - f16 intermediate accumulations in attention (if precision allows)
 - Cooperative matrix multiply (if available)
 - ONNX Runtime WebGPU Flash Attention 2 (PR #22932) as reference
+- llama.cpp WebGPU flash_attn.wgsl uses global KV loads for M3 (shared
+  memory pre-loading is slower on Apple Silicon)
+- 2D matmul tiling: TILE_M=4, TILE_N=4, WG_SIZE=8×8=64 → 79.5% of optimal
+- vec4 loads when K divisible by 4 → 12.7% speedup (ONNX Runtime PR #29271)
 
 ---
 
 ## Future Optimization Opportunities
 
-### P3: Use f16 storage for vision activations
+### P3: Q8_0 in-shader dequantization (BIGGEST WIN)
+
+**Analysis**: The vision tower is memory-bandwidth bound, not compute bound.
+Total weight reads per layer: 55.5 MB (f32). At ~100 GB/s (M3 unified memory),
+theoretical minimum is ~15ms per layer, but actual is ~1260ms — 84× slower.
+
+The weights are currently dequantized from Q8_0 to f32 on CPU during load,
+then uploaded as f32 buffers. If we kept them as Q8_0 and dequantized in the
+shader, weight buffers would be 4× smaller:
+- QKV: 15.9 MB → 4.2 MB
+- FFN up: 19.8 MB → 5.2 MB
+- FFN down: 19.8 MB → 5.2 MB
+- Total per layer: 55.5 MB → 14.6 MB
+- Total 27 layers: 1.5 GB → 394 MB
+
+This would dramatically reduce memory bandwidth pressure. Each Q8_0 block
+is 34 bytes (2-byte f16 scale + 32 int8 values). The shader reads the scale,
+then multiplies each int8 value by it.
+
+**Challenge**: Requires rewriting all matmul shaders to handle Q8_0 layout.
+The weight buffer binding changes from `array<f32>` to `array<u32>` (packed
+Q8_0 blocks). Each thread reads its Q8_0 block, dequantizes to f32, then
+does the dot product.
+
+### P4: f16 storage for vision activations
+
 All activation buffers use f32 (4 bytes). Using f16 would halve memory
-bandwidth. The vision tower is memory-bandwidth bound. Need to verify
-accuracy impact — LayerNorm should keep values in reasonable range.
+bandwidth for activations. Apple Silicon has native f16 support (Metal).
+Requires `shader-f16` feature. Vision tower activations can tolerate f16
+precision (CLIP ViT models run successfully with f16 on WebGPU).
 
-### P4: Subgroup operations for LayerNorm
-LayerNorm shader uses @workgroup_size(64) but only thread 0 does the
-reduction (3 sequential passes over D=1152). Use subgroupAdd() for
-mean/variance reductions — 64x more parallelism.
+**Note**: Weight bandwidth (55.5 MB/layer) dominates activation bandwidth
+(~9.4 MB/layer), so P3 (Q8_0 dequant) is more impactful than P4 (f16
+activations). Doing both would be ideal.
 
-### P5: Fuse LayerNorm into QKV matmul
-LayerNorm and QKV matmul are separate dispatches. Fusing them eliminates
-one full read+write of hidden states per layer (27 × numPatches × 1152 × 4
-bytes saved).
+### P5: 2D tiling for matmul
 
-### P6: Request higher workgroup storage limit
-Current TILE_SIZE=16 due to 16KB default workgroup storage limit. The
-adapter supports 32KB — requesting it in `requiredLimits` would allow
-TILE_SIZE=32, doubling attention tile efficiency.
+Current matmul: 1 thread per output column, loops over K. Each workgroup
+(64 threads) handles 64 columns. For QKV (3456 outputs), that's 54 workgroups.
+
+2D tiling (from llama.cpp): each thread computes a 4×4 tile of outputs.
+TILE_M=4, TILE_N=4, WG_SIZE=8×8=64. This improves weight reuse and reduces
+workgroup count. Research shows 79.5% of optimal GFLOPs with this pattern.
+
+### P6: Subgroup operations (Chrome 134+)
+
+`subgroupAdd()`, `subgroupMax()` for softmax reductions. Eliminates shared
+memory and barriers. 1.29x prefill speedup in ONNX Runtime tests.
+
+**Status**: Chrome 134+ only. Not in Safari or Firefox yet. Must detect and
+fall back. Apple Silicon supports subgroups in Metal but Safari doesn't
+expose them in WebGPU yet.
 
 ### P7: Create test images with known text content
 Create synthetic images with clear, large text to verify text recognition
 accuracy. This will help measure the impact of the bicubic fix and future
 accuracy improvements.
+
+---
+
+## Findings: What DIDN'T work
+
+### Parallel LayerNorm with tree reduction (TESTED, REVERTED)
+Tried parallelizing LayerNorm with 64-thread tree reduction (shared memory).
+Result: 22% SLOWER (33.9s → 41.6s vision tower).
+
+**Why**: On Apple Silicon's SIMD architecture, all 64 threads in a workgroup
+execute in lockstep. The "redundant" work in the single-thread version (all
+64 threads doing the same 3456 iterations) is FREE — it's just one SIMD
+instruction executed 64 times in hardware. The parallel version adds 12+
+workgroupBarriers per row, which stall the SIMD pipeline. Barriers are
+expensive (~1000-2000 cycles each on Metal), and with 234 rows × 12 barriers
+= 2808 barriers, the overhead dominates.
+
+**Lesson**: On SIMD GPUs, "redundant" work across threads in lockstep is free.
+Parallelization that adds barriers can be counterproductive. Only parallelize
+if the parallel version has fewer total cycles (including barrier overhead).
+
+### 32KB workgroup storage for TILE_SIZE=32 attention (TESTED, REVERTED)
+Tried requesting 32KB workgroup storage to use TILE_SIZE=32 in attention.
+Result: SLOWER (due to reduced GPU occupancy).
+
+**Why**: Larger workgroup storage means fewer workgroups can run simultaneously
+on each GPU core, reducing parallelism. The TILE_SIZE=16 with 16KB default
+provides better occupancy and is faster overall.
+
+### Fused LayerNorm + QKV matmul (TESTED, REVERTED)
+Tried fusing LayerNorm into the QKV matmul shader (load X, normalize in
+shared memory, then matmul). Result: SLOWER for large M (234 patches).
+
+**Why**: The fused shader processes all M rows sequentially in each workgroup,
+adding 12 barriers per row for the LayerNorm reduction. The separate approach
+runs LayerNorm as a separate dispatch (all rows in parallel, 1 workgroup per
+row), then matmul as another dispatch. The separate approach has better
+parallelism because the GPU can schedule LayerNorm workgroups and matmul
+workgroups independently.
+
+**Lesson**: Kernel fusion is not always beneficial. When the fused kernel
+serializes work that was previously parallelized across dispatches, the
+barrier overhead can exceed the saved memory traffic.
 
 ---
 
@@ -169,3 +256,12 @@ accuracy improvements.
   - `docs/VLM_OPTIMIZATION_LOG.md` (this file)
 - Results: 33% faster vision tower, 37% faster prefill, 58% faster tokens/s
 - Accuracy: Red image ✓, screenshot gives more coherent description
+
+### 2025-01-XX: Parallel LayerNorm + 32KB storage + fused LN+matmul (REVERTED)
+- Status: REVERTED (all three optimizations were slower)
+- Tested: parallel tree-reduction LayerNorm, 32KB workgroup storage with
+  TILE_SIZE=32, fused LayerNorm+QKV matmul
+- All three caused regressions due to barrier overhead and reduced occupancy
+- Findings documented above in "What DIDN'T work" section
+- Kept: documentation comments in shaders explaining why these approaches
+  don't work on Apple Silicon SIMD architecture

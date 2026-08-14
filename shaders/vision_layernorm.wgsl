@@ -2,10 +2,16 @@
 // LayerNorm: y = (x - mean) / sqrt(var + eps) * gamma + beta
 // eps = 1e-6 (from clip.vision.layer_norm_epsilon)
 //
-// Uses @workgroup_size(64) with a single-thread two-pass reduction.
-// One workgroup per row — 64 threads are available but only thread 0 does the
-// reduction (the workgroup size is set to 64 for GPU occupancy efficiency;
-// the extra threads are idle but the scheduler handles this better than wg=1).
+// Uses @workgroup_size(64) with a single-thread reduction.
+// One workgroup per row — all 64 threads execute the same code in SIMD lockstep
+// (no divergence, no barriers), which is faster on Apple Silicon than a parallel
+// tree reduction that requires 12+ workgroupBarriers per row.
+//
+// Testing showed parallel tree reduction was 22% SLOWER due to barrier overhead:
+// - Old (single-thread, no barriers): 33.9s vision tower
+// - New (tree reduction, 12 barriers/row): 41.6s vision tower
+// The "redundant" work across 64 SIMD threads is free on GPU hardware.
+
 struct Params {
   R: u32,    // number of rows (seq_len)
   D: u32,    // hidden_size (1152)

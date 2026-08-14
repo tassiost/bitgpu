@@ -16,7 +16,7 @@
 // ensure all threads reach barriers uniformly.
 
 const WG_SIZE: u32 = 32u;
-const TILE_SIZE: u32 = 16u;  // 16 × 72 × 4 = 4608 bytes per tile, 9216 total < 16KB limit
+const TILE_SIZE: u32 = 16u;  // 16 × 72 × 4 = 4608 bytes per tile, 9216 total < 16KB default
 
 struct Params {
   num_heads: u32,     // 16
