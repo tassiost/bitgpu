@@ -97,7 +97,8 @@ async function main() {
     `&mmproj=http://localhost:${port}/${mmprojFile}` +
     `&tokenizerJson=http://localhost:${port}/${tokenizerJson}` +
     `&tokenizerConfig=http://localhost:${port}/${tokenizerConfig}` +
-    `&image=synthetic-red` +
+    `&image=file` +
+    `&imageUrl=http://localhost:${port}/test-screenshot.png` +
     `&run=1`
 
   // Find Chrome
