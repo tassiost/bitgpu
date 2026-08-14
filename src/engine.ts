@@ -20,16 +20,49 @@ import type {
   ForwardResult,
   GenerateOptions,
   GenerateResult,
+  ImageInput,
   KvSnapshot,
   Manifest,
   ManifestRef as Ref,
   ManifestTensor,
   TokenLogprobs,
+  VisionConfig,
+  VisionForwardResult,
 } from './types'
+import {
+  createVisionState,
+  loadVisionWeights,
+  preprocessImage,
+  computeVisionPosEmbed,
+  computeVisionRoPE,
+  type VisionState,
+} from './vision'
 
 type Field = ['f' | 'u', number]
 // Manifest / ManifestTensor / ManifestArch / ManifestRef are public types now (src/types.ts):
 // bitgpu/gguf builds manifests in memory, so callers can hold and pass them.
+
+/** Default vision config for the Qwen3-VL Bonsai-27B mmproj.
+ *  The GGUF manifest doesn't carry vision metadata (it lives in the separate
+ *  mmproj pack), so we inject this when visionMmprojUrl is provided.
+ *  Values match the Qwen3VLVisionConfig defaults from transformers. */
+const DEFAULT_VISION_CONFIG: VisionConfig = {
+  depth: 27,
+  hidden_size: 1152,
+  intermediate_size: 4304,
+  num_heads: 16,
+  head_dim: 72,
+  patch_size: 16,
+  temporal_patch_size: 2,
+  spatial_merge_size: 2,
+  out_hidden_size: 3584,
+  in_channels: 3,
+  num_position_embeddings: 2304,
+  image_token_id: 151655,
+  vision_start_token_id: 151652,
+  vision_end_token_id: 151653,
+  deepstack_visual_indexes: [8, 16, 24],
+}
 
 interface GpuWeight {
   buf?: GPUBuffer
@@ -223,6 +256,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
   const A = manifest.arch
   const T = manifest.tensors
+  // Vision tower: initialized when the manifest declares a vision config OR when
+  // visionMmprojUrl is explicitly provided (the GGUF manifest doesn't carry vision
+  // metadata — it lives in the separate mmproj pack). Text-only models never import,
+  // compile, or allocate anything vision-related.
+  const visionCfg: VisionConfig | undefined = A.vision ?? (opts.visionMmprojUrl ? DEFAULT_VISION_CONFIG : undefined)
+  let visionState: VisionState | null = visionCfg ? createVisionState(visionCfg) : null
   // Fail loud on manifests the kernels cannot run, instead of producing silent garbage: the WGSL
   // assumes silu activation, head_dim <= 128 (per-thread register arrays), and 128-wide scale blocks.
   const FINAL_NORM = `layers.${A.layers}.final_norm_layernorm`
@@ -280,6 +319,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const sgMax = info.subgroupMaxSize ?? 32
   const sgMin = info.subgroupMinSize ?? sgMax
   const forceNoSG = opts.forceNoSubgroups ?? false
+  const GPU_DEQUANT = opts.gpuDequant ?? false // GPU-side Q1_0 dequant (~2x faster upload)
+  const BATCH_UPLOAD = opts.batchUpload ?? false // batch raw uploads into one writeBuffer (~3-5x on top of gpuDequant)
+  const MAPPED_UPLOAD = opts.mappedUpload ?? false // mappedAtCreation for raw buffers (skip writeBuffer IPC)
   // No-subgroup reduction workgroup size. Snapped to a power of two in [32, 256]: the _wg kernels'
   // tree reductions halve the stride each step, so any other size silently drops partial sums.
   const WG_NS = Math.min(256, Math.max(32, 1 << Math.round(Math.log2(opts.noSubgroupWorkgroupSize ?? 64))))
@@ -314,6 +356,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // f16 activation-compute for the decode matmuls: needs shader-f16 AND the subgroup path; falls
   // back to f32 without them (like kvCache:'f16'). Decode-only precision mode; residual stream f32.
   const actF16 = opts.activation === 'f16' && useSG && adapter.features.has('shader-f16' as GPUFeatureName)
+  // fused decode: fold RMSNorm into the matmul kernels (saves 2 dispatches/layer).
+  // Only on the subgroup decode path (S===1); prefill and no-subgroup paths unchanged.
+  const fusedDec = !!opts.fusedDecode && useSG && !actF16 // not yet compatible with af16 path
+  // fused QKV: merge the 3 post-QKV-matmul dispatches into one (kv8 + subgroup decode only)
+  const fusedQKV = !!opts.fusedQKV && useSG && kv8 && !actF16 && !fusedDec
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
   if (kv16 || actF16) features.push('shader-f16' as GPUFeatureName)
@@ -422,6 +469,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   }
   const ROWS_MR = 4 // output rows per workgroup in the multi-row GEMV
   const specs: Array<[string, Record<string, number>?]> = [...WGSLS.map((n): [string] => [n]), ['matmul_split_tiled'], ['matmul_resid_tiled'], ['argmax'], ['embed_gather'], ['embed_gather_batch'], ['sampler_penalty'], ['argmax_masked'], ['logsumexp'], ['sampler_sigma']]
+  if (GPU_DEQUANT) specs.push(['dequant_q10'])
   if (useSG) {
     for (const n of ['rmsnorm_sg', 'attention_sg', 'matmul_split_sg', 'matmul_q2_sg', 'rmsnorm_rope_sg']) specs.push([n, { SG: sgMax }])
     for (const n of ['matmul_split_sm', 'matmul_resid_sm', 'matmul_q2_sm']) specs.push([n, { SG: sgMax }]) // small-batch (M=2..9) verify-pass GEMVs
@@ -441,12 +489,18 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     specs.push(['copy_kv8'])
     if (useSG) for (const n of ['attention_sg_kv8', 'rmsnorm_rope_sg_kv8']) specs.push([n, { SG: sgMax }])
     else specs.push(['attention_wg_kv8'])
+    if (fusedQKV) specs.push(['qk_v_norm_rope_cache_sg', { SG: sgMax }])
   }
   if (actF16) {
     // f16-activation decode matmuls (shader-f16; subgroup path only) - the input-side f16 variants
     // of the 1-bit layer GEMVs, plus the rmsnorm that feeds them an f16 activation.
     for (const n of ['rmsnorm_sg_af16', 'matmul_split_sg_af16']) specs.push([n, { SG: sgMax }])
     for (const n of ['matmul_swiglu_mr_sg_af16', 'matmul_resid_mr_sg_af16']) specs.push([n, { SG: sgMax, ROWS: ROWS_MR }])
+  }
+  if (fusedDec) {
+    // fused RMSNorm+matmul decode kernels (subgroup path only; saves 2 dispatches/layer)
+    specs.push(['matmul_split_sg_rms', { SG: sgMax }])
+    specs.push(['matmul_swiglu_mr_sg_rms', { SG: sgMax, ROWS: ROWS_MR }])
   }
   // Rolling-window (sinks) attention reads rotate K at read time, so it has its own kernel per
   // mode+path. The sg roll kernels keep the rotate partner in-lane only when SG <= head_dim/2;
@@ -478,6 +532,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     specs.push(['deltanet_norm_gate', { WG: 64 }])
     specs.push(['attention_online', { WGD: A.head_dim }])
     specs.push([kv8 ? 'attention_online_cache_kv8' : 'attention_online_cache', { WGD: A.head_dim }])
+  }
+  // Vision tower pipelines (compiled only when the model has a vision config)
+  if (visionState) {
+    // All vision shaders use fixed @workgroup_size — no overrides needed
+    for (const n of ['vision_matmul', 'vision_layernorm', 'vision_gelu', 'vision_add',
+                      'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
+                      'vision_inject'])
+      specs.push([n])
   }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
 
@@ -638,6 +700,23 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     signTable[b] = bits
   }
 
+  // GPU-side dequant: upload LUTs as buffers for the dequant_q10 shader
+  let tgt2Buf: GPUBuffer | null = null
+  let signTableBuf: GPUBuffer | null = null
+  const dequantJobs: Array<{ raw: GPUBuffer; out: GPUBuffer; scales: GPUBuffer; numBlocks: number; mode: number }> = []
+  const dequantCopies: Array<{ src: GPUBuffer; dst: GPUBuffer; dstOff: number; len: number }> = []
+  // Batch upload: accumulate raw bytes in JS, single writeBuffer after streaming
+  let batchArray: Uint8Array | null = null
+  let batchCursor = 0
+  const batchEntries: Array<{ buf: GPUBuffer; off: number; len: number }> = []
+  if (GPU_DEQUANT) {
+    const S_LUT = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+    tgt2Buf = device.createBuffer({ size: 512, usage: S_LUT })
+    device.queue.writeBuffer(tgt2Buf, 0, tgt2)
+    signTableBuf = device.createBuffer({ size: 256, usage: S_LUT })
+    device.queue.writeBuffer(signTableBuf, 0, signTable)
+  }
+
   // ---- streaming weight loader ----
   // Every data-file tensor is wired as a ROUTE: a byte range of the file feeding a GPU buffer
   // (optionally through a per-byte transform: the binary sign table, or the 1->2 q2 code
@@ -675,6 +754,25 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       },
     }
   }
+  // mappedSink: like gpuSink but writes directly into a mappedAtCreation buffer.
+  // Eliminates all writeBuffer IPC/shmem overhead — chunks are memcpy'd into the
+  // mapped range, then the buffer is unmapped on finish(). On Apple Silicon UMA
+  // this can skip the staging buffer copy entirely (direct GPU memory mapping).
+  const mappedSink = (len: number): { buf: GPUBuffer; push: (b: Uint8Array) => void; finish: () => void } => {
+    const buf = device.createBuffer({ size: (len + 3) & ~3, usage: S_ | CD, mappedAtCreation: true })
+    const mapped = new Uint8Array(buf.getMappedRange())
+    let written = 0
+    return {
+      buf,
+      push(bytes: Uint8Array): void {
+        mapped.set(bytes, written)
+        written += bytes.length
+      },
+      finish(): void {
+        buf.unmap()
+      },
+    }
+  }
   // Wire a ref to a sink: data-file refs register a stream route; aux refs feed the sink NOW.
   const wire = (ref: Ref, push: (b: Uint8Array) => void, finish: () => void): void => {
     if (ref.src === 'aux') {
@@ -685,6 +783,22 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const wireRaw = (ref: Ref, buf: GPUBuffer, base = 0): void => {
     const s = gpuSink(buf, base)
     wire(ref, s.push, s.finish)
+  }
+  // Batch upload: accumulate raw bytes into a single JS array instead of per-chunk writeBuffer.
+  // After streaming, one writeBuffer uploads the entire batch, then copyBufferToBuffer distributes.
+  // Each tensor's data is padded to 4-byte alignment (copyBufferToBuffer requires aligned offsets).
+  const wireBatch = (ref: Ref, buf: GPUBuffer): void => {
+    if (!batchArray) return
+    const off = batchCursor
+    const paddedLen = (ref.len + 3) & ~3 // pad to 4 bytes for copyBufferToBuffer alignment
+    wire(
+      ref,
+      (b) => { batchArray!.set(b, batchCursor); batchCursor += b.length },
+      () => {
+        batchEntries.push({ buf, off, len: ref.len })
+        batchCursor = off + paddedLen // advance to next 4-byte boundary
+      },
+    )
   }
   // Per-byte weight transforms, shared by the planar (ONNX) and q1_0-container (GGUF)
   // routes - the sign-byte stream is identical across the two containers.
@@ -774,11 +888,64 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // Deferred zero-point checks: q2 zp tensors stream with the weights, so their bytes are only
   // complete after the streaming pass; each closure then validates and installs the real value.
   const zpChecks: Array<() => void> = []
+  // Pre-allocate batch array if batchUpload is enabled: sum all raw Q1_0 byte ranges
+  // with 4-byte padding per tensor (copyBufferToBuffer requires aligned offsets)
+  if (BATCH_UPLOAD && GPU_DEQUANT) {
+    const paddedLen = (n: number) => (n + 3) & ~3
+    let totalRaw = 0
+    for (const [, t] of Object.entries(T)) {
+      if (t.kind === 'q2' && t.q1_0) totalRaw += paddedLen(t.q1_0.len)
+    }
+    // Fused parts are wired inside fuse() — count them too
+    if (manifest.arch.hybrid) {
+      for (let li = 0; li < A.layers; li++) {
+        for (const s of ['mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']) {
+          const t = T[`layers.${li}.${s}`]
+          if (t?.q1_0) totalRaw += paddedLen(t.q1_0.len)
+        }
+        if (manifest.arch.hybrid.layer_types[li] === 'full') {
+          for (const s of ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.o_proj']) {
+            const t = T[`layers.${li}.${s}`]
+            if (t?.q1_0) totalRaw += paddedLen(t.q1_0.len)
+          }
+        } else {
+          for (const s of ['linear.in_qkv', 'linear.z', 'linear.a', 'linear.b', 'linear.out_proj']) {
+            const t = T[`layers.${li}.${s}`]
+            if (t?.q1_0) totalRaw += paddedLen(t.q1_0.len)
+          }
+        }
+      }
+    } else {
+      for (let li = 0; li < A.layers; li++) {
+        for (const nm of ['attn.q_proj', 'attn.k_proj', 'attn.v_proj', 'attn.o_proj', 'mlp.gate_proj', 'mlp.up_proj', 'mlp.down_proj']) {
+          const t = T[`layers.${li}.${nm}`]
+          if (t?.q1_0) totalRaw += paddedLen(t.q1_0.len)
+        }
+      }
+    }
+    if (totalRaw > 0) {
+      batchArray = new Uint8Array(totalRaw)
+      batchCursor = 0
+    }
+  }
   for (const [name, t] of Object.entries(T)) {
     if (t.kind === 'q2') {
       const codes = gbuf(t.weight!.len * 2) // 1 byte of q2 data expands to 2 code bytes
       const scales = gbuf(t.scales!.len)
-      if (t.q1_0) {
+      if (t.q1_0 && GPU_DEQUANT) {
+        // GPU dequant: upload raw Q1_0 blocks, dispatch shader after streaming
+        const numBlocks = t.q1_0.len / 18
+        if (MAPPED_UPLOAD) {
+          const ms = mappedSink(t.q1_0.len)
+          wire(t.q1_0, ms.push, ms.finish)
+          dequantJobs.push({ raw: ms.buf, out: codes, scales, numBlocks, mode: 0 })
+        } else {
+          const raw = gbuf(t.q1_0.len)
+          if (BATCH_UPLOAD && batchArray) wireBatch(t.q1_0, raw)
+          else wireRaw(t.q1_0, raw)
+          dequantJobs.push({ raw, out: codes, scales, numBlocks, mode: 0 })
+        }
+      } else if (t.q1_0) {
         const cs = gpuSink(codes, 0)
         const ss = gpuSink(scales, 0)
         wireQ10(t.q1_0, xfQ2(cs.push), cs.finish, ss.push, ss.finish)
@@ -817,7 +984,31 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     let so = 0
     let co = 0
     for (const p of parts) {
-      if (p.q1_0) {
+      if (p.q1_0 && GPU_DEQUANT) {
+        // GPU dequant: upload raw Q1_0 blocks, dispatch shader after streaming
+        const numBlocks = p.q1_0.len / 18
+        let raw: GPUBuffer
+        if (MAPPED_UPLOAD) {
+          const ms = mappedSink(p.q1_0.len)
+          wire(p.q1_0, ms.push, ms.finish)
+          raw = ms.buf
+        } else {
+          raw = gbuf(p.q1_0.len)
+          if (BATCH_UPLOAD && batchArray) wireBatch(p.q1_0, raw)
+          else wireRaw(p.q1_0, raw)
+        }
+        // Sign mode: output is sign bytes (1 per sign byte), not codes (2 per sign byte)
+        // The sign buffer slice for this part is at [so, so + p.weight!.len)
+        // The scales buffer slice is at [co, co + p.scales!.len)
+        // We need a separate output buffer for this part's dequant, then copy into the fused buffer
+        // Part buffers need COPY_SRC for the copyBufferToBuffer into the fused buffer
+        const partSign = device.createBuffer({ size: (p.weight!.len + 3) & ~3, usage: S_ | CD | CS })
+        const partScales = device.createBuffer({ size: (p.scales!.len + 3) & ~3, usage: S_ | CD | CS })
+        dequantJobs.push({ raw, out: partSign, scales: partScales, numBlocks, mode: 1 })
+        // Copy the part buffers into the fused buffer slices after dequant (done in post-stream)
+        dequantCopies.push({ src: partSign, dst: sign, dstOff: so, len: p.weight!.len })
+        dequantCopies.push({ src: partScales, dst: scales, dstOff: co, len: p.scales!.len })
+      } else if (p.q1_0) {
         const ws = gpuSink(sign, so)
         const ss = gpuSink(scales, co)
         wireQ10(p.q1_0, xfSign(ws.push), ws.finish, ss.push, ss.finish)
@@ -979,6 +1170,62 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   for (const check of zpChecks) check()
   zpChecks.length = 0
   aux = null as unknown as ArrayBuffer
+
+  // Batch upload: single writeBuffer for all raw Q1_0 bytes, then copyBufferToBuffer
+  // to distribute into individual tensor buffers. Eliminates ~3700 per-chunk
+  // writeBuffer IPC/shmem roundtrips → 1 writeBuffer + ~200 GPU-side copies.
+  if (BATCH_UPLOAD && batchArray && batchEntries.length > 0) {
+    const stagingBuf = device.createBuffer({
+      size: batchArray.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    })
+    device.queue.writeBuffer(stagingBuf, 0, batchArray)
+    const enc = device.createCommandEncoder()
+    for (const e of batchEntries) {
+      enc.copyBufferToBuffer(stagingBuf, e.off, e.buf, 0, e.len)
+    }
+    device.queue.submit([enc.finish()])
+    stagingBuf.destroy() // free the staging buffer immediately
+    batchArray = null // let GC reclaim the JS array
+  }
+
+  // GPU-side dequant: dispatch the dequant_q10 shader for each Q1_0 tensor,
+  // then copy part buffers into fused buffer slices. This replaces the CPU
+  // wireQ10 + xfQ2/xfSign + f16f32 transforms with a single compute pass.
+  if (GPU_DEQUANT && dequantJobs.length > 0) {
+    const enc = device.createCommandEncoder()
+    const pass = enc.beginComputePass()
+    const pipe = pipelines['dequant_q10'] as GPUComputePipeline
+    const bindLayout = pipe.getBindGroupLayout(0)
+    for (const job of dequantJobs) {
+      const numBlocksAligned = ((job.numBlocks + 63) / 64) | 0
+      const params = new Uint32Array([job.numBlocks, job.mode, 0, 0])
+      const paramBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+      device.queue.writeBuffer(paramBuf, 0, params)
+      const bg = device.createBindGroup({
+        layout: bindLayout,
+        entries: [
+          { binding: 0, resource: { buffer: paramBuf } },
+          { binding: 1, resource: { buffer: job.raw } },
+          { binding: 2, resource: { buffer: tgt2Buf! } },
+          { binding: 3, resource: { buffer: signTableBuf! } },
+          { binding: 4, resource: { buffer: job.out } },
+          { binding: 5, resource: { buffer: job.scales } },
+        ],
+      })
+      pass.setPipeline(pipe)
+      pass.setBindGroup(0, bg)
+      pass.dispatchWorkgroups(numBlocksAligned)
+    }
+    pass.end()
+    // Copy part buffers into fused buffer slices
+    for (const copy of dequantCopies) {
+      enc.copyBufferToBuffer(copy.src, 0, copy.dst, copy.dstOff, copy.len)
+    }
+    device.queue.submit([enc.finish()])
+    dequantJobs.length = 0
+    dequantCopies.length = 0
+  }
 
   // GPU embedding gather for a batch of prompt tokens: upload S u32 ids (bytes, not S*H floats)
   // and dequantize the rows on the GPU (embed_gather_batch.wgsl - same math as the decode
@@ -1218,7 +1465,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const enc = device.createCommandEncoder()
     enc.copyBufferToBuffer(buf, 0, rb, 0, n * 4)
     device.queue.submit([enc.finish()])
-    await rb.mapAsync(GPUMapMode.READ)
+    // Race mapAsync against device.lost — if the GPU reset (watchdog, OOM, driver crash),
+    // mapAsync would hang forever. The lost promise resolves and we throw instead.
+    await Promise.race([
+      rb.mapAsync(GPUMapMode.READ),
+      lost.then((info) => { throw new Error(`GPU device lost during readback: ${info.reason}`) }),
+    ])
     const out = new Float32Array(rb.getMappedRange().slice(0))
     rb.unmap()
     rb.destroy()
@@ -1229,7 +1481,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const enc = device.createCommandEncoder()
     enc.copyBufferToBuffer(buf, 0, rb, 0, n * 4)
     device.queue.submit([enc.finish()])
-    await rb.mapAsync(GPUMapMode.READ)
+    await Promise.race([
+      rb.mapAsync(GPUMapMode.READ),
+      lost.then((info) => { throw new Error(`GPU device lost during readback: ${info.reason}`) }),
+    ])
     const out = new Uint32Array(rb.getMappedRange().slice(0))
     rb.unmap()
     rb.destroy()
@@ -1512,8 +1767,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // runs. The normalized activations (n1/n2) and the SwiGLU intermediate (sw) go f16; the
     // residual stream, attention, o_proj and weights stay f32, so nothing downstream changes.
     const af = actF16 && S === 1 && !FORCE_SLOW
+    const fd = fusedDec && S === 1 && !FORCE_SLOW && !af // fused decode: RMSNorm folded into matmuls
+    const fq = fusedQKV && S === 1 && !FORCE_SLOW && !af // fused QKV: merge post-matmul dispatches
     const n1 = af ? actBuf16(Hd) : actBuf(S * Hd)
-    rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1, af)
+    if (!fd) rms(pass, h, `layers.${li}.input_layernorm`, S, Hd, n1, af)
     const qkv = W[`layers.${li}.attn.qkv`]
 
     if (useSG && S === 1 && !FORCE_SLOW) {
@@ -1523,20 +1780,34 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         v = actBuf(KV * Dh)
       const Ntot = qkv.N0! + qkv.N1! + qkv.N2!,
         gx = Math.min(Ntot, 65535)
-      runWG(pass, af ? 'matmul_split_sg_af16' : 'matmul_split_sg', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx]], [n1, qkv.sign!, qkv.scales!], [q, k, v], gx, Math.ceil(Ntot / gx))
-      appendKV(pass, v, 1, li, KV, posBase * KV)
-      const qr = actBuf(H * Dh)
-      runN(pass, 'rmsnorm_rope_sg', [['u', H], ['u', Dh], ['f', A.rms_eps], ['u', 0], ['u', Dh], ['u', 0]], [q, W[`layers.${li}.attn.q_norm`].buf!, cos, sin], qr, H)
-      // Sink mode stores K UNROPED (rotation happens at attention read): bind cos=1/sin=0 so
-      // the same write kernels store the plain rmsnorm output.
-      const kcos = roll ? rollOnes! : cos,
-        ksin = roll ? rollZeros! : sin
-      if (kv8) {
-        // fused K write, quantizing into the cache (extra scale binding -> its own dispatch)
-        setup(pass, 'rmsnorm_rope_sg_kv8', [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV], ['u', 0], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, kcos, ksin], [Kc[li], Ksc[li]])
-        pass.dispatchWorkgroups(isFull('rmsnorm_rope_sg_kv8') ? KV : 1)
+      if (fd) {
+        // fused: RMSNorm folded into the matmul — pass raw h, gamma, and eps directly
+        runWG(pass, 'matmul_split_sg_rms', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx], ['u', Hd], ['u', 0], ['f', A.rms_eps], ['u', 0], ['u', 0], ['u', 0]], [h, qkv.sign!, qkv.scales!, W[`layers.${li}.input_layernorm`].buf!], [q, k, v], gx, Math.ceil(Ntot / gx))
       } else {
-        runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, kcos, ksin], Kc[li], KV)
+        runWG(pass, af ? 'matmul_split_sg_af16' : 'matmul_split_sg', [['u', qkv.K!], ['u', qkv.nb!], ['u', qkv.N0!], ['u', qkv.N1!], ['u', qkv.N2!], ['u', gx]], [n1, qkv.sign!, qkv.scales!], [q, k, v], gx, Math.ceil(Ntot / gx))
+      }
+      if (!fq) appendKV(pass, v, 1, li, KV, posBase * KV)
+      const qr = actBuf(H * Dh)
+      if (fq) {
+        // fused QKV: merge Q norm+rope, K norm+rope+cache, V cache into one dispatch
+        setup(pass, 'qk_v_norm_rope_cache_sg',
+          [['u', H], ['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV], ['u', roll ? 0 : 1]],
+          [q, k, v, W[`layers.${li}.attn.q_norm`].buf!, W[`layers.${li}.attn.k_norm`].buf!, cos, sin],
+          [qr, Kc[li], Ksc[li], Vc[li], Vsc[li]])
+        pass.dispatchWorkgroups(isFull('qk_v_norm_rope_cache_sg') ? (H + KV) : 1)
+      } else {
+        runN(pass, 'rmsnorm_rope_sg', [['u', H], ['u', Dh], ['f', A.rms_eps], ['u', 0], ['u', Dh], ['u', 0]], [q, W[`layers.${li}.attn.q_norm`].buf!, cos, sin], qr, H)
+        // Sink mode stores K UNROPED (rotation happens at attention read): bind cos=1/sin=0 so
+        // the same write kernels store the plain rmsnorm output.
+        const kcos = roll ? rollOnes! : cos,
+          ksin = roll ? rollZeros! : sin
+        if (kv8) {
+          // fused K write, quantizing into the cache (extra scale binding -> its own dispatch)
+          setup(pass, 'rmsnorm_rope_sg_kv8', [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV], ['u', 0], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, kcos, ksin], [Kc[li], Ksc[li]])
+          pass.dispatchWorkgroups(isFull('rmsnorm_rope_sg_kv8') ? KV : 1)
+        } else {
+          runN(pass, ROPE_K, [['u', KV], ['u', Dh], ['f', A.rms_eps], ['u', posBase * KV * Dh], ['u', Dh], ['u', 0]], [k, W[`layers.${li}.attn.k_norm`].buf!, kcos, ksin], Kc[li], KV)
+        }
       }
       cap(li, 'qr', qr)
       const att = actBuf(H * Dh)
@@ -1546,12 +1817,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         h2 = actBuf(Hd)
       residMM(pass, o, att, h, 1, h2) // o_proj: attention output is f32, so this stays f32
       const n2 = af ? actBuf16(Hd) : actBuf(Hd)
-      rms(pass, h2, `layers.${li}.post_attention_layernorm`, 1, Hd, n2, af)
+      if (!fd) rms(pass, h2, `layers.${li}.post_attention_layernorm`, 1, Hd, n2, af)
       const gu = W[`layers.${li}.mlp.gateup`],
         sw = af ? actBuf16(F) : actBuf(F),
         nwgF = Math.ceil(F / ROWS_MR),
         gxF = Math.min(nwgF, 65535)
-      runWG(pass, af ? 'matmul_swiglu_mr_sg_af16' : 'matmul_swiglu_mr_sg', [['u', gu.K!], ['u', gu.nb!], ['u', F], ['u', gxF], ['u', 0], ['u', 0]], [n2, gu.sign!, gu.scales!], [sw], gxF, Math.ceil(nwgF / gxF))
+      if (fd) {
+        // fused: RMSNorm folded into the SwiGLU matmul — pass raw h2, gamma, and eps directly
+        runWG(pass, 'matmul_swiglu_mr_sg_rms', [['u', gu.K!], ['u', gu.nb!], ['u', F], ['u', gxF], ['u', Hd], ['u', 0], ['u', 0], ['u', 0], ['f', A.rms_eps], ['u', 0], ['u', 0], ['u', 0]], [h2, gu.sign!, gu.scales!, W[`layers.${li}.post_attention_layernorm`].buf!], [sw], gxF, Math.ceil(nwgF / gxF))
+      } else {
+        runWG(pass, af ? 'matmul_swiglu_mr_sg_af16' : 'matmul_swiglu_mr_sg', [['u', gu.K!], ['u', gu.nb!], ['u', F], ['u', gxF], ['u', 0], ['u', 0]], [n2, gu.sign!, gu.scales!], [sw], gxF, Math.ceil(nwgF / gxF))
+      }
       cap(li, 'sw', sw)
       const d = W[`layers.${li}.mlp.down_proj`],
         hn = actBuf(Hd)
@@ -1702,7 +1978,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // blocks the GPU for whole seconds. Returns the LAST segment's final-norm buffer + the final
   // token's row within it, or null when aborted (fullHistory is cleared: K/V is only partially
   // written, so nothing may reuse the sequence).
-  async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
+  async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal, imgInj?: { positions: number[]; embeds: GPUBuffer }): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
     const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
@@ -1720,12 +1996,56 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       // (some Metal configurations) slip past this, which is why the segment size is ALSO
       // memory-budgeted (PREFILL_SEG_HY) - this guard is the backstop for backends that do report.
       device.pushErrorScope('out-of-memory')
-      const enc = device.createCommandEncoder()
-      fn = stack(enc, embedBatch(enc, seg), seg.length, posBase + off).fn
-      lastRow = seg.length - 1
-      device.queue.submit([enc.finish()])
-      const oom = await device.popErrorScope()
-      if (oom) throw new Error(`bitgpu: GPU out of memory during prefill (segment of ${seg.length} tokens at position ${posBase + off}) - the output would have been silently corrupted. Lower maxSeqLen, use kvCache: 'q8', or free GPU memory.`)
+      try {
+        const enc = device.createCommandEncoder()
+        let embedOut = embedBatch(enc, seg)
+        // Image embedding injection: overwrite image_token_id positions with vision embeddings.
+        // Filter to positions within this segment [off, off+seg.length).
+        if (imgInj) {
+          const segStart = off, segEnd = off + seg.length
+          const segPositions: number[] = []
+          const segIndices: number[] = []
+          for (let i = 0; i < imgInj.positions.length; i++) {
+            const pos = imgInj.positions[i]
+            if (pos >= segStart && pos < segEnd) {
+              segPositions.push(pos - segStart)
+              segIndices.push(i)
+            }
+          }
+          if (segPositions.length > 0) {
+            const posBuf = upload(new Uint32Array(segPositions))
+            // Gather the relevant vision embedding rows into a segment-local buffer.
+            // Image tokens are typically contiguous, but handle non-contiguous too.
+            const segEmbeds = actBuf(segPositions.length * Hd)
+            const firstIdx = segIndices[0]
+            let contiguous = true
+            for (let i = 1; i < segIndices.length; i++) {
+              if (segIndices[i] !== firstIdx + i) { contiguous = false; break }
+            }
+            if (contiguous) {
+              enc.copyBufferToBuffer(imgInj.embeds, firstIdx * Hd * 4, segEmbeds, 0, segPositions.length * Hd * 4)
+            } else {
+              for (let i = 0; i < segIndices.length; i++) {
+                enc.copyBufferToBuffer(imgInj.embeds, segIndices[i] * Hd * 4, segEmbeds, i * Hd * 4, Hd * 4)
+              }
+            }
+            // Inject: overwrite token_embeds[segPositions[i]] with segEmbeds[i]
+            const injectPass = enc.beginComputePass()
+            setup(injectPass, 'vision_inject',
+              [['u', Hd], ['u', segPositions.length], ['u', 0], ['u', 0]],
+              [posBuf, segEmbeds], [embedOut])
+            injectPass.dispatchWorkgroups(segPositions.length)
+            injectPass.end()
+            transients?.push(posBuf, segEmbeds)
+          }
+        }
+        fn = stack(enc, embedOut, seg.length, posBase + off).fn
+        lastRow = seg.length - 1
+        device.queue.submit([enc.finish()])
+      } finally {
+        const oom = await device.popErrorScope()
+        if (oom) throw new Error(`bitgpu: GPU out of memory during prefill (segment of ${seg.length} tokens at position ${posBase + off}) - the output would have been silently corrupted. Lower maxSeqLen, use kvCache: 'q8', or free GPU memory.`)
+      }
       if (off + prefillSeg < ids.length) {
         await device.queue.onSubmittedWorkDone()
         flushTransients() // this segment's scratch is dead; the peak stays at one segment
@@ -2683,6 +3003,125 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
+  // Multimodal generate: run the vision tower on `images`, then prefill `promptTokenIds`
+  // with image embeddings injected at `imagePositions` (the positions of image_token_id
+  // placeholders in the token sequence), then decode as normal. The vision tower's
+  // projection_dim (5120) matches the LLM hidden_size, so no projection layer is needed.
+  // `imagePositions` must be sorted and each position must be < promptTokenIds.length.
+  async function generateWithImages(
+    promptTokenIds: number[],
+    imagePositions: number[],
+    images: ImageInput[],
+    genOpts: GenerateOptions = {},
+  ): Promise<GenerateResult> {
+    if (!visionState || !visionCfg) {
+      throw new Error('generateWithImages: this model has no vision tower')
+    }
+    if (images.length === 0) {
+      return generate(promptTokenIds, genOpts)
+    }
+    if (imagePositions.length === 0) {
+      throw new Error('generateWithImages: imagePositions is empty but images were provided')
+    }
+
+    // 1. Run the vision tower to get image embeddings [numMerged, 5120]
+    const visResult = await visionForward(images)
+    if (visResult.numPatches !== imagePositions.length) {
+      throw new Error(
+        `generateWithImages: vision tower produced ${visResult.numPatches} image embeddings ` +
+        `but the token sequence has ${imagePositions.length} image_token_id placeholders — they must match`,
+      )
+    }
+
+    // 2. Upload vision embeddings to a GPU buffer
+    const visionEmbedsBuf = device.createBuffer({
+      size: visResult.imageEmbeds.byteLength,
+      usage: S_ | CD | CS,
+    })
+    device.queue.writeBuffer(visionEmbedsBuf, 0, visResult.imageEmbeds.buffer, visResult.imageEmbeds.byteOffset, visResult.imageEmbeds.byteLength)
+
+    // 3. Prefill with image injection, then decode via the normal generate() path.
+    //    We can't call generate() directly because it calls runPrefill internally.
+    //    Instead, replicate the generate() flow but pass imgInj to runPrefill.
+    const sampled = genOpts.temperature != null && genOpts.temperature > 0 && genOpts.temperature !== 1
+    const hasProcessors = (genOpts.repetitionPenalty ?? 1) !== 1 || (genOpts.noRepeatNgramSize ?? 0) > 0 || (genOpts.presencePenalty ?? 0) !== 0 || (genOpts.dryMultiplier ?? 0) > 0
+
+    if (genOpts.signal?.aborted) {
+      return { tokens: [], prefillMs: 0, decodeMs: 0, tokensPerSecond: 0, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+    }
+
+    // Non-reuse: reset cache, prefill the full prompt with image injection
+    const posBase = 0
+    const prefillTokens = promptTokenIds
+    if (prefillTokens.length === 0) throw new Error('generateWithImages: no tokens to process')
+    if (prefillTokens.length > maxSeqLen) throw new Error(`generateWithImages: sequence length ${prefillTokens.length} exceeds maxSeqLen ${maxSeqLen}`)
+
+    const room = maxSeqLen - posBase - prefillTokens.length
+    if (room < 1) throw new Error(`generateWithImages: prompt length ${posBase + prefillTokens.length} exceeds maxSeqLen ${maxSeqLen}; trim history or raise maxSeqLen`)
+    const maxTokens = Math.min(genOpts.maxTokens ?? 256, room)
+
+    const hist = [...promptTokenIds]
+    fullHistory = hist
+
+    try {
+      await ensureKvCapacity(posBase + prefillTokens.length + 1)
+      transients = []
+      let prefillMs = 0
+      try {
+        const t0 = performance.now()
+        // Feed all but the LAST token (same as generate's non-reuse prefill path)
+        if (prefillTokens.length > 1) {
+          // Filter image positions to those before the last token (which is re-fed on next turn)
+          const prefillImgPositions = imagePositions.filter(p => p < prefillTokens.length - 1)
+          const prefillImgInj = prefillImgPositions.length > 0
+            ? { positions: prefillImgPositions, embeds: visionEmbedsBuf }
+            : undefined
+          await runPrefill(prefillTokens.slice(0, -1), posBase, genOpts.signal, prefillImgInj)
+          await device.queue.onSubmittedWorkDone()
+        }
+        cacheLen = posBase + prefillTokens.length - 1
+        prefillMs = performance.now() - t0
+      } finally {
+        flushTransients()
+        transients = null
+      }
+
+      if (maxTokens < 1) {
+        return { tokens: [], prefillMs, decodeMs: 0, tokensPerSecond: 0, timing: { recordMs: 0, gpuMs: 0, readbackMs: 0 } }
+      }
+
+      // Decode: re-feed the last prefill token at its position, then generate
+      const lastToken = prefillTokens[prefillTokens.length - 1]
+      const decodeIds = [lastToken]
+      const decodePos = posBase + prefillTokens.length - 1
+
+      const hasFilter = !!genOpts.candidateFilter || (genOpts.logprobs ?? 0) > 0
+      let r: RawGenResult
+      if (sampled || hasProcessors || hasFilter) {
+        r = await generateSampledImpl(decodeIds, decodePos, maxTokens, genOpts, hist)
+      } else {
+        r = await generateImpl(decodeIds, decodePos, maxTokens, null, SYNC_N, { stopTokens: genOpts.stopTokens, onToken: genOpts.onToken, signal: genOpts.signal })
+        hist.push(...r.tokens)
+      }
+
+      return {
+        tokens: r.tokens,
+        prefillMs,
+        decodeMs: r.decodeMs,
+        tokensPerSecond: r.tokPerSec,
+        timing: { recordMs: r.recMs, gpuMs: r.gpuMs, readbackMs: r.rbMs },
+        ...(r.spec ? { speculation: r.spec } : {}),
+        ...(r.lp ? { logprobs: r.lp } : {}),
+      }
+    } catch (e) {
+      fullHistory = []
+      cacheLen = 0
+      throw e
+    } finally {
+      visionEmbedsBuf.destroy()
+    }
+  }
+
   // Prefill a prompt PREFIX into the KV cache without decoding, then stop. A later
   // generate(delta, {reuseCache:true}) continues from it, so a static system prompt can be warmed at
   // load and the user's first turn becomes a cheap cache-append instead of a full prefill. Like a
@@ -2891,6 +3330,366 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // Bonsai-27B: gguf_norm - hf_raw == 1.0 exactly, tensor-wide. So the weight-multiply RMSNorm
   // kernels reproduce the model as-is; no load-time bake. (The gated DeltaNet norm ships raw.)
 
+  // Shader warm: run a dummy decode step to force GPU driver JIT compilation of all
+  // pipeline state objects. The first real decode token then skips the driver's lazy
+  // native shader compilation, reducing TTFT. Mirrors the diffusion preload pattern.
+  if (opts.warmShaders) {
+    try {
+      await ensureKvCapacity(2)
+      transients = []
+      const enc = device.createCommandEncoder()
+      const embG = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
+      const tokBuf = device.createBuffer({ size: 4, usage: S_ | CS })
+      device.queue.writeBuffer(tokBuf, 0, new Uint32Array([1])) // dummy token id
+      // embed_gather: reads tokBuf[0], writes the embedding into embG
+      const pass0 = enc.beginComputePass()
+      runN(pass0, 'embed_gather', [['u', Hd], ['u', 0], ['u', 0], ['u', 0]], [tokBuf, embWqG, tgt4G, embScalesG, embZpG], embG, 1)
+      pass0.end()
+      // stack: runs all 28 layers (the main shader-heavy path)
+      const { fn } = stack(enc, embG, 1, 0)
+      // lm_head + argmax: completes the decode pipeline
+      const lg = device.createBuffer({ size: W.lm_head.N! * 4, usage: S_ | CS })
+      const pass1 = enc.beginComputePass()
+      lmHead(pass1, fn, 1, lg)
+      runN(pass1, 'argmax', [['u', W.lm_head.N!], ['u', 0], ['u', 0], ['u', 0]], [lg], tokBuf, 1)
+      pass1.end()
+      device.queue.submit([enc.finish()])
+      await device.queue.onSubmittedWorkDone()
+      // Discard: reset all cache state so the first real generate starts fresh
+      fullHistory = []
+      cacheLen = 0
+      flushTransients()
+      transients = null
+      embG.destroy()
+      tokBuf.destroy()
+      lg.destroy()
+    } catch { /* warm failure is non-fatal — the first real decode will JIT anyway */ }
+  }
+
+  // Vision tower forward pass (GPU dispatch). Only available when the model has a vision config.
+  // The mmproj pack is loaded lazily on first call. Throws for text-only models.
+  async function visionForward(images: ImageInput[]): Promise<VisionForwardResult> {
+    if (!visionState || !visionCfg) {
+      throw new Error('visionForward: this model has no vision tower (arch.vision is undefined)')
+    }
+    // Load the mmproj pack lazily on first call
+    if (!visionState.loaded && !visionState.loading) {
+      const mmprojUrl = opts.visionMmprojUrl
+      if (!mmprojUrl) {
+        throw new Error('visionForward: visionMmprojUrl not set — cannot load vision weights')
+      }
+      visionState.loading = loadVisionWeights(mmprojUrl).then(({ weights, config }) => {
+        visionState!.weights = weights
+        visionState!.config = config
+        visionState!.loaded = true
+        visionState!.loading = null
+        // Upload all vision weights to GPU buffers
+        const vw = weights!
+        const up = (data: Float32Array): GPUBuffer => {
+          // Copy into a fresh ArrayBuffer to avoid byteOffset/view issues
+          const copy = new Float32Array(data)
+          const b = device.createBuffer({ size: copy.byteLength, usage: S_ | CD | CS })
+          device.queue.writeBuffer(b, 0, copy.buffer, 0, copy.byteLength)
+          return b
+        }
+        const vb = visionState!.buffers
+        vb.set('patchEmbdWeight', up(vw.patchEmbdWeight))
+        vb.set('patchEmbdBias', up(vw.patchEmbdBias))
+        vb.set('positionEmbd', up(vw.positionEmbd))
+        vb.set('postLnWeight', up(vw.postLnWeight))
+        vb.set('postLnBias', up(vw.postLnBias))
+        vb.set('mm0Weight', up(vw.mergerMm0Weight))
+        vb.set('mm0Bias', up(vw.mergerMm0Bias))
+        vb.set('mm2Weight', up(vw.mergerMm2Weight))
+        vb.set('mm2Bias', up(vw.mergerMm2Bias))
+        for (let li = 0; li < vw.layers.length; li++) {
+          const lw = vw.layers[li]
+          const p = `l${li}.`
+          vb.set(p + 'ln1W', up(lw.ln1Weight))
+          vb.set(p + 'ln1B', up(lw.ln1Bias))
+          vb.set(p + 'qkvW', up(lw.qkvWeight))
+          vb.set(p + 'qkvB', up(lw.qkvBias))
+          vb.set(p + 'attnOutW', up(lw.attnOutWeight))
+          vb.set(p + 'attnOutB', up(lw.attnOutBias))
+          vb.set(p + 'ln2W', up(lw.ln2Weight))
+          vb.set(p + 'ln2B', up(lw.ln2Bias))
+          vb.set(p + 'ffnUpW', up(lw.ffnUpWeight))
+          vb.set(p + 'ffnUpB', up(lw.ffnUpBias))
+          vb.set(p + 'ffnDownW', up(lw.ffnDownWeight))
+          vb.set(p + 'ffnDownB', up(lw.ffnDownBias))
+        }
+      })
+    }
+    if (visionState.loading) {
+      await visionState.loading
+    }
+    if (!visionState.weights || !visionState.buffers.size) {
+      throw new Error('visionForward: weights failed to load')
+    }
+
+    const t0 = performance.now()
+    const cfg = visionState.config
+    const vw = visionState.buffers
+    const H = cfg.hidden_size      // 1152
+    const heads = cfg.num_heads    // 16
+    const hd = cfg.head_dim        // 72
+    const inter = cfg.intermediate_size  // 4304
+    const projDim = cfg.out_hidden_size  // 5120
+    const eps = 1e-6
+    const depth = cfg.depth            // 27
+    const mergeSize = cfg.spatial_merge_size  // 2
+
+    // Process each image: CPU preprocess → GPU forward
+    const allEmbeds: Float32Array[] = []
+    const allNumMerged: number[] = []
+
+    for (const image of images) {
+      // CPU preprocessing (one-time per image)
+      const { patches, numPatches, gridThw } = preprocessImage(image, cfg)
+      const posEmbeds = computeVisionPosEmbed(gridThw, cfg, visionState.weights.positionEmbd)
+      const [t, h, w] = gridThw
+      const mergedH = h / mergeSize
+      const mergedW = w / mergeSize
+      const numMerged = t * mergedH * mergedW
+      const mergedDim = H * mergeSize * mergeSize  // 4608
+
+      // Upload CPU-preprocessed data to GPU
+
+      const patchBuf = device.createBuffer({ size: patches.byteLength, usage: S_ | CD })
+      device.queue.writeBuffer(patchBuf, 0, patches.buffer, patches.byteOffset, patches.byteLength)
+      const posBuf = device.createBuffer({ size: posEmbeds.byteLength, usage: S_ | CD })
+      device.queue.writeBuffer(posBuf, 0, posEmbeds.buffer, posEmbeds.byteOffset, posEmbeds.byteLength)
+
+      // cu_seqlens for attention: one segment per frame (qwen3_vl default)
+      const [gt, gh, gw] = gridThw
+      const framePatches = gh * gw
+      const cuSeqlens = new Uint32Array(gt + 1)
+      cuSeqlens[0] = 0
+      for (let f = 0; f < gt; f++) cuSeqlens[f + 1] = cuSeqlens[f] + framePatches
+      const numSegments = gt
+      const cuBuf = device.createBuffer({ size: cuSeqlens.byteLength, usage: S_ | CD })
+      device.queue.writeBuffer(cuBuf, 0, cuSeqlens.buffer)
+
+      // Allocate activation buffers (double-buffered for residual adds)
+      const actBuf = (n: number): GPUBuffer => device.createBuffer({ size: n * 4, usage: S_ | CD | CS })
+      // Dummy buffers for unused matmul outputs (out1/out2 when N1=N2=0).
+      // WebGPU rejects writable storage buffer aliasing — can't bind the same buffer to multiple outputs.
+      const dummy1 = device.createBuffer({ size: 16, usage: S_ | CD })
+      const dummy2 = device.createBuffer({ size: 16, usage: S_ | CD })
+      let h0 = actBuf(numPatches * H)  // current hidden states
+      let h1 = actBuf(numPatches * H)  // scratch for residual add output
+
+      // Compute 2D RoPE cos/sin caches (CPU, one-time per image)
+      const { cos: ropeCos, sin: ropeSin } = computeVisionRoPE(gridThw, mergeSize, hd)
+      const cosBuf = device.createBuffer({ size: ropeCos.byteLength, usage: S_ | CD })
+      device.queue.writeBuffer(cosBuf, 0, ropeCos.buffer, ropeCos.byteOffset, ropeCos.byteLength)
+      const sinBuf = device.createBuffer({ size: ropeSin.byteLength, usage: S_ | CD })
+      device.queue.writeBuffer(sinBuf, 0, ropeSin.buffer, ropeSin.byteOffset, ropeSin.byteLength)
+
+      // Vision forward: split into multiple submits to avoid macOS GPU watchdog timeout.
+      // The watchdog fires per-command-buffer (~5s). A single compute pass with 27 layers
+      // on a large image (3072 patches) can exceed this, causing a GPU reset + infinite hang.
+      // Each layer is submitted separately — the WebGPU queue guarantees in-order execution.
+      let enc = device.createCommandEncoder()
+      let pass = enc.beginComputePass()
+
+      // 1. Patch embedding: linear(1536→1152) + bias
+      const patchOut = actBuf(numPatches * H)
+      setup(pass, 'vision_patch_embed',
+        [['u', numPatches], ['u', 1536], ['u', H], ['u', 0]],
+        [patchBuf, vw.get('patchEmbdWeight')!, vw.get('patchEmbdBias')!],
+        [patchOut])
+      pass.dispatchWorkgroups(Math.ceil(H / 64), 1, 1)
+
+      // 2. Add position embeddings: h0 = patchOut + posEmbeds
+      setup(pass, 'vision_add',
+        [['u', numPatches * H], ['u', 0], ['u', 0], ['u', 0]],
+        [patchOut, posBuf], [h0])
+      {
+        const [gx, gy] = grid2d(Math.ceil((numPatches * H) / 64))
+        pass.dispatchWorkgroups(gx, gy, 1)
+      }
+
+      // Submit patch embed + add pos as its own command buffer
+      pass.end()
+      device.queue.submit([enc.finish()])
+
+      // 3. 27 transformer blocks
+      // Pre-allocate scratch buffers ONCE and reuse across all layers.
+      // Allocating per-layer would use ~228MB × 27 = 6.1GB for large images,
+      // causing GPU OOM/thrashing. These buffers are scratch — written and
+      // consumed within the same layer, safe to reuse.
+      const normedBuf = actBuf(numPatches * H)
+      const normed2Buf = actBuf(numPatches * H)
+      const qBuf = actBuf(numPatches * H)
+      const kBuf = actBuf(numPatches * H)
+      const vBuf = actBuf(numPatches * H)
+      const attnOut = actBuf(numPatches * H)
+      const attnProj = actBuf(numPatches * H)
+      const upBuf = actBuf(numPatches * inter)
+      const actBuf_ = actBuf(numPatches * inter)
+      const downBuf = actBuf(numPatches * H)
+      for (let li = 0; li < depth; li++) {
+        // Start a new command buffer for this layer (watchdog safety)
+        enc = device.createCommandEncoder()
+        pass = enc.beginComputePass()
+        const p = `l${li}.`
+        // --- Attention block ---
+        // LayerNorm1
+        runN(pass, 'vision_layernorm',
+          [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
+          [h0, vw.get(p + 'ln1W')!, vw.get(p + 'ln1B')!], normedBuf, numPatches)
+
+        // QKV projection with split outputs: [numPatches, 1152] → Q,K,V each [numPatches, 1152]
+        // vision_matmul routes by N0/N1/N2: N0=H (Q), N1=H (K), N2=H (V)
+        setup(pass, 'vision_matmul',
+          [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
+          [normedBuf, vw.get(p + 'qkvW')!, vw.get(p + 'qkvB')!],
+          [qBuf, kBuf, vBuf])
+        pass.dispatchWorkgroups(Math.ceil(3 * H / 64))
+
+        // Bidirectional attention with 2D RoPE: one workgroup per (segment, head, query_block)
+        // @workgroup_size(32) — each thread handles one query, 32 queries per workgroup
+        setup(pass, 'vision_attention',
+          [['u', heads], ['u', hd], ['u', numSegments], ['f', 1 / Math.sqrt(hd)], ['u', hd / 2], ['u', 0], ['u', 0]],
+          [qBuf, kBuf, vBuf, cuBuf, cosBuf, sinBuf], [attnOut])
+        pass.dispatchWorkgroups(numSegments, heads, Math.ceil(framePatches / 32))
+
+        // Output projection: [numPatches, H] → [numPatches, H]
+        // Single-output matmul: N0=H, N1=0, N2=0 → everything to out0
+        setup(pass, 'vision_matmul',
+          [['u', numPatches], ['u', H], ['u', H], ['u', H], ['u', 0], ['u', 0], ['u', 1]],
+          [attnOut, vw.get(p + 'attnOutW')!, vw.get(p + 'attnOutB')!],
+          [attnProj, dummy1, dummy2])  // out1/out2 unused → dummies (no aliasing)
+        pass.dispatchWorkgroups(Math.ceil(H / 64))
+
+        // Residual add: h1 = h0 + attnProj
+        setup(pass, 'vision_add',
+          [['u', numPatches * H], ['u', 0], ['u', 0], ['u', 0]],
+          [h0, attnProj], [h1])
+        {
+          const [gx, gy] = grid2d(Math.ceil((numPatches * H) / 64))
+          pass.dispatchWorkgroups(gx, gy, 1)
+        }
+        ;[h0, h1] = [h1, h0]  // swap
+
+        // --- MLP block ---
+        // LayerNorm2
+        runN(pass, 'vision_layernorm',
+          [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
+          [h0, vw.get(p + 'ln2W')!, vw.get(p + 'ln2B')!], normed2Buf, numPatches)
+
+        // FFN up: [numPatches, H] → [numPatches, inter]
+        setup(pass, 'vision_matmul',
+          [['u', numPatches], ['u', inter], ['u', H], ['u', inter], ['u', 0], ['u', 0], ['u', 1]],
+          [normed2Buf, vw.get(p + 'ffnUpW')!, vw.get(p + 'ffnUpB')!],
+          [upBuf, dummy1, dummy2])
+        pass.dispatchWorkgroups(Math.ceil(inter / 64))
+
+        // GELU
+        runIO(pass, 'vision_gelu',
+          [['u', numPatches * inter], ['u', 0], ['u', 0], ['u', 0]],
+          [upBuf], [actBuf_], numPatches * inter)
+
+        // FFN down: [numPatches, inter] → [numPatches, H]
+        setup(pass, 'vision_matmul',
+          [['u', numPatches], ['u', H], ['u', inter], ['u', H], ['u', 0], ['u', 0], ['u', 1]],
+          [actBuf_, vw.get(p + 'ffnDownW')!, vw.get(p + 'ffnDownB')!],
+          [downBuf, dummy1, dummy2])
+        pass.dispatchWorkgroups(Math.ceil(H / 64))
+
+        // Residual add: h1 = h0 + down
+        setup(pass, 'vision_add',
+          [['u', numPatches * H], ['u', 0], ['u', 0], ['u', 0]],
+          [h0, downBuf], [h1])
+        {
+          const [gx, gy] = grid2d(Math.ceil((numPatches * H) / 64))
+          pass.dispatchWorkgroups(gx, gy, 1)
+        }
+
+        ;[h0, h1] = [h1, h0]  // swap
+
+        // Submit this layer's command buffer (watchdog safety: each layer < 5s GPU time)
+        pass.end()
+        device.queue.submit([enc.finish()])
+        // Drain the GPU queue every 3 layers to prevent command buffer buildup
+        // (rapid-fire submits without waiting can exhaust driver command buffer slots)
+        if (li % 3 === 2) await device.queue.onSubmittedWorkDone()
+      }
+
+      // Start a new command buffer for the merger
+      enc = device.createCommandEncoder()
+      pass = enc.beginComputePass()
+
+      // 4. Post layernorm
+      const postLn = actBuf(numPatches * H)
+      runN(pass, 'vision_layernorm',
+        [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
+        [h0, vw.get('postLnWeight')!, vw.get('postLnBias')!], postLn, numPatches)
+
+      // 5. Patch merger: pixel shuffle 2x2
+      const shuffled = actBuf(numMerged * mergedDim)
+      setup(pass, 'vision_patch_merger',
+        [['u', t], ['u', h], ['u', w], ['u', H]],
+        [postLn], [shuffled])
+      pass.dispatchWorkgroups(numMerged)
+
+      // 6. mm.0: linear(4608→4608) + bias
+      const mm0Out = actBuf(numMerged * mergedDim)
+      setup(pass, 'vision_matmul',
+        [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', mergedDim], ['u', 0], ['u', 0], ['u', 1]],
+        [shuffled, vw.get('mm0Weight')!, vw.get('mm0Bias')!],
+        [mm0Out, dummy1, dummy2])
+      pass.dispatchWorkgroups(Math.ceil(mergedDim / 64))
+
+      // 7. GELU
+      const mm0Act = actBuf(numMerged * mergedDim)
+      runIO(pass, 'vision_gelu',
+        [['u', numMerged * mergedDim], ['u', 0], ['u', 0], ['u', 0]],
+        [mm0Out], [mm0Act], numMerged * mergedDim)
+
+      // 8. mm.2: linear(4608→5120) + bias
+      const imageEmbedsBuf = actBuf(numMerged * projDim)
+      setup(pass, 'vision_matmul',
+        [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
+        [mm0Act, vw.get('mm2Weight')!, vw.get('mm2Bias')!],
+        [imageEmbedsBuf, dummy1, dummy2])
+      pass.dispatchWorkgroups(Math.ceil(projDim / 64))
+
+      pass.end()
+      device.queue.submit([enc.finish()])
+
+      // Read back image embeddings
+      const imageEmbeds = await readback(imageEmbedsBuf, numMerged * projDim)
+      allEmbeds.push(imageEmbeds)
+      allNumMerged.push(numMerged)
+
+      // Cleanup per-image buffers (after submit + readback, so GPU is done with them)
+      normedBuf.destroy(); normed2Buf.destroy()
+      qBuf.destroy(); kBuf.destroy(); vBuf.destroy()
+      attnOut.destroy(); attnProj.destroy()
+      upBuf.destroy(); actBuf_.destroy(); downBuf.destroy()
+      patchBuf.destroy(); posBuf.destroy(); h0.destroy(); h1.destroy(); cuBuf.destroy()
+      cosBuf.destroy(); sinBuf.destroy()
+      patchOut.destroy(); postLn.destroy(); shuffled.destroy()
+      mm0Out.destroy(); mm0Act.destroy(); imageEmbedsBuf.destroy(); dummy1.destroy(); dummy2.destroy()
+    }
+
+    // Concatenate all image embeddings
+    const totalMerged = allNumMerged.reduce((a, b) => a + b, 0)
+    const imageEmbeds = new Float32Array(totalMerged * projDim)
+    let offset = 0
+    for (const e of allEmbeds) { imageEmbeds.set(e, offset); offset += e.length }
+
+    const elapsedMs = performance.now() - t0
+    return {
+      imageEmbeds,
+      numPatches: totalMerged,
+      deepstackFeatures: [],
+      elapsedMs,
+    }
+  }
+
   const api: EngineInternal = {
     generate: serialize(generate),
     prefill: serialize(prefill),
@@ -2900,7 +3699,22 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     resetCache,
     capabilities,
     lost,
-    dispose: () => device.destroy(),
+    vision: !!visionState,
+    ...(visionState ? { visionForward: serialize(visionForward), generateWithImages: serialize(generateWithImages) } : {}),
+    dispose: () => {
+      tgt2Buf?.destroy()
+      signTableBuf?.destroy()
+      evictScratch?.destroy()
+      // Vision tower cleanup — destroy any loaded vision GPU buffers
+      if (visionState) {
+        for (const buf of visionState.buffers.values()) {
+          try { buf.destroy() } catch { /* already destroyed */ }
+        }
+        visionState.buffers.clear()
+        visionState = null
+      }
+      device.destroy()
+    },
     device,
     adapter,
     // The debug/profile trio overwrites K/V from position 0 and shares every flag and buffer the

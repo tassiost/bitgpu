@@ -155,6 +155,9 @@ function softmax(arr: Float32Array | number[]): number[] {
  *  the kept set is their shorter prefix. With both off the draw is bit-identical to the plain path
  *  (m == k, sum over all K). Returns a token id. */
 export function sampleFromCandidates(candIds: Uint32Array | number[], candVals: Float32Array | number[], temperature: number, rng: MT19937, topP = 1, minP = 0): number {
+  if (temperature <= 0 || temperature === 1) {
+    return candIds[0]  // greedy: return the top candidate (candidates are sorted descending)
+  }
   const k = candVals.length
   const tv = new Float32Array(k)
   for (let i = 0; i < k; ++i) tv[i] = candVals[i] / temperature // divide (exact for any T), matches TemperatureLogitsWarper

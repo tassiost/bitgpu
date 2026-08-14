@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>bitgpu - vision tower GPU vs CPU verification</title>
+  <style>
+    body { font: 14px/1.5 ui-monospace, monospace; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+    h1 { font-size: 18px; }
+    button { font: inherit; padding: 8px 14px; cursor: pointer; }
+    pre { background: #f4f4f5; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+    .pass { color: #166534; font-weight: 700; }
+    .fail { color: #b91c1c; font-weight: 700; }
+    .warn { color: #b45309; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <h1>bitgpu - vision tower GPU vs CPU verification</h1>
+  <p>Compares the GPU dispatch (WGSL shaders) against the CPU reference implementation.
+     Both use the same mmproj weights and the same test image. The GPU output must
+     match the CPU output with cosine similarity > 0.999.</p>
+  <p>
+    Model: <input id="modelUrl" size="60" value="" placeholder="http://localhost:8888/Bonsai-27B-Q1_0.gguf" /><br/>
+    Mmproj: <input id="mmprojUrl" size="60" value="" placeholder="http://localhost:8888/Bonsai-27B-mmproj-Q8_0.gguf" /><br/>
+    Image: <select id="imageSelect">
+      <option value="synthetic-red">Synthetic 32x32 red</option>
+      <option value="synthetic-gradient">Synthetic 64x64 gradient</option>
+      <option value="synthetic-noise">Synthetic 128x128 noise</option>
+    </select>
+  </p>
+  <button id="run">Run vision verification</button>
+  <pre id="out">idle.</pre>
+
+  <script type="module">
+    import { createEngine, loadVisionWeights, visionForwardCpu, preprocessImage } from '../dist/index.js';
+    import { fromGguf } from '../dist/gguf.js';
+
+    const out = document.getElementById('out');
+    const log = (s) => { out.textContent += s + '\n'; };
+    const cos = (a, b) => {
+      let d = 0, na = 0, nb = 0;
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) { d += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+      return d / (Math.sqrt(na) * Math.sqrt(nb) + 1e-9);
+    };
+    const maxAbsDiff = (a, b) => {
+      let m = 0;
+      const n = Math.min(a.length, b.length);
+      for (let i = 0; i < n; i++) m = Math.max(m, Math.abs(a[i] - b[i]));
+      return m;
+    };
+    const stats = (a) => {
+      let min = Infinity, max = -Infinity, sum = 0;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] < min) min = a[i];
+        if (a[i] > max) max = a[i];
+        sum += a[i];
+      }
+      return { min, max, mean: sum / a.length };
+    };
+
+    // Auto-fill from URL params
+    const params = new URLSearchParams(location.search);
+    if (params.get('model')) document.getElementById('modelUrl').value = params.get('model');
+    if (params.get('mmproj')) document.getElementById('mmprojUrl').value = params.get('mmproj');
+    if (params.get('image')) document.getElementById('imageSelect').value = params.get('image');
+
+    function makeImage(type) {
+      if (type === 'synthetic-red') {
+        const w = 32, h = 32;
+        const rgb = new Float32Array(3 * w * h);
+        for (let i = 0; i < w * h; i++) { rgb[i*3] = 1.0; rgb[i*3+1] = 0.0; rgb[i*3+2] = 0.0; }
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+      if (type === 'synthetic-gradient') {
+        const w = 64, h = 64;
+        const rgb = new Float32Array(3 * w * h);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 3;
+          rgb[i] = x / w; rgb[i+1] = y / h; rgb[i+2] = (x + y) / (w + h);
+        }
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+      if (type === 'synthetic-noise') {
+        const w = 128, h = 128;
+        const rgb = new Float32Array(3 * w * h);
+        // deterministic PRNG (seeded)
+        let seed = 42;
+        const rng = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+        for (let i = 0; i < 3 * w * h; i++) rgb[i] = rng();
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+    }
+
+    document.getElementById('run').onclick = async () => {
+      out.textContent = '';
+      let ok = true;
+      try {
+        const modelUrl = document.getElementById('modelUrl').value;
+        const mmprojUrl = document.getElementById('mmprojUrl').value;
+        const imageType = document.getElementById('imageSelect').value;
+        const image = makeImage(imageType);
+
+        if (!modelUrl || !mmprojUrl) {
+          log('❌ Please provide both model and mmproj URLs');
+          return;
+        }
+
+        // ─── 1. Load CPU reference weights ───────────────────────────
+        log('1. Loading vision weights for CPU reference...');
+        const t0 = performance.now();
+        const { weights, config } = await loadVisionWeights(mmprojUrl);
+        log(`   Loaded in ${(performance.now() - t0).toFixed(0)}ms`);
+        log(`   Config: hidden=${config.hidden_size}, heads=${config.num_heads}, head_dim=${config.head_dim}, depth=${config.depth}, proj=${config.out_hidden_size}`);
+
+        // ─── 2. Run CPU reference ────────────────────────────────────
+        log('\n2. Running CPU vision forward (reference)...');
+        const t1 = performance.now();
+        const cpuResult = visionForwardCpu([image], weights, config);
+        const cpuMs = performance.now() - t1;
+        log(`   CPU forward: ${cpuMs.toFixed(0)}ms`);
+        log(`   Output: ${cpuResult.imageEmbeds.length} floats (${cpuResult.numPatches} patches × ${config.out_hidden_size} dims)`);
+        const cpuStats = stats(cpuResult.imageEmbeds);
+        log(`   CPU stats: min=${cpuStats.min.toFixed(4)}, max=${cpuStats.max.toFixed(4)}, mean=${cpuStats.mean.toFixed(4)}`);
+
+        // ─── 3. Create GPU engine ────────────────────────────────────
+        log('\n3. Creating GPU engine from GGUF...');
+        const t2 = performance.now();
+        const parsed = await fromGguf(modelUrl);
+        log(`   GGUF parsed: ${Object.keys(parsed.manifest.tensors).length} tensors`);
+        const engine = await createEngine({
+          ...parsed,
+          visionMmprojUrl: mmprojUrl,
+          warmShaders: false,
+        });
+        log(`   Engine created in ${(performance.now() - t2).toFixed(0)}ms`);
+        log(`   Vision support: ${engine.vision}`);
+
+        if (!engine.visionForward) {
+          log('❌ Engine has no visionForward — model may not have vision arch');
+          ok = false;
+        } else {
+          // ─── 4. Run GPU vision forward ─────────────────────────────
+          log('\n4. Running GPU vision forward...');
+          const t3 = performance.now();
+          const gpuResult = await engine.visionForward([image]);
+          const gpuMs = performance.now() - t3;
+          log(`   GPU forward: ${gpuMs.toFixed(0)}ms`);
+          log(`   Output: ${gpuResult.imageEmbeds.length} floats (${gpuResult.numPatches} patches)`);
+          const gpuStats = stats(gpuResult.imageEmbeds);
+          log(`   GPU stats: min=${gpuStats.min.toFixed(4)}, max=${gpuStats.max.toFixed(4)}, mean=${gpuStats.mean.toFixed(4)}`);
+
+          // Debug: check first few values
+          log(`   First 10 GPU values: [${Array.from(gpuResult.imageEmbeds.slice(0, 10)).map(v => v.toFixed(4)).join(', ')}]`);
+
+          // ─── 5. Compare ────────────────────────────────────────────
+          log('\n5. Comparing CPU vs GPU...');
+          if (cpuResult.imageEmbeds.length !== gpuResult.imageEmbeds.length) {
+            log(`   ❌ Length mismatch: CPU=${cpuResult.imageEmbeds.length}, GPU=${gpuResult.imageEmbeds.length}`);
+            ok = false;
+          } else {
+            const c = cos(cpuResult.imageEmbeds, gpuResult.imageEmbeds);
+            const mae = maxAbsDiff(cpuResult.imageEmbeds, gpuResult.imageEmbeds);
+            log(`   Cosine similarity: ${c.toFixed(7)}`);
+            log(`   Max abs diff: ${mae.toFixed(6)}`);
+            log(`   Speedup: ${(cpuMs / gpuMs).toFixed(2)}x`);
+
+            // Per-patch comparison
+            const dims = config.out_hidden_size;
+            const numPatches = cpuResult.numPatches;
+            let minPatchCos = 1, maxPatchCos = 1;
+            for (let p = 0; p < numPatches; p++) {
+              const pc = cos(
+                cpuResult.imageEmbeds.subarray(p * dims, (p + 1) * dims),
+                gpuResult.imageEmbeds.subarray(p * dims, (p + 1) * dims),
+              );
+              if (p === 0) { minPatchCos = pc; maxPatchCos = pc; }
+              else { minPatchCos = Math.min(minPatchCos, pc); maxPatchCos = Math.max(maxPatchCos, pc); }
+            }
+            log(`   Per-patch cosine: min=${minPatchCos.toFixed(7)}, max=${maxPatchCos.toFixed(7)}`);
+
+            // Gate
+            const pass = c > 0.999;
+            ok = ok && pass;
+            log(`\n   ${pass ? '[PASS]' : '[FAIL]'} Overall cosine > 0.999: ${c.toFixed(7)}`);
+
+            if (!pass) {
+              // Show first few differing values
+              log('\n   First 10 values comparison:');
+              for (let i = 0; i < 10; i++) {
+                log(`     [${i}] CPU=${cpuResult.imageEmbeds[i].toFixed(6)}  GPU=${gpuResult.imageEmbeds[i].toFixed(6)}  diff=${(cpuResult.imageEmbeds[i] - gpuResult.imageEmbeds[i]).toFixed(6)}`);
+              }
+            }
+          }
+        }
+
+        engine.dispose();
+
+        // ─── Summary ─────────────────────────────────────────────────
+        log(`\n${ok ? '✅ VISION VERIFICATION PASSED' : '❌ VISION VERIFICATION FAILED'}`);
+
+      } catch (e) {
+        log(`\n❌ ERROR: ${e.message}`);
+        log(e.stack || '');
+        ok = false;
+      }
+    };
+
+    // Auto-run if ?run=1
+    if (params.get('run') === '1') {
+      document.getElementById('run').click();
+    }
+  </script>
+</body>
+</html>

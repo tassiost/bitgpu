@@ -12,11 +12,42 @@ import { Template } from '@huggingface/jinja'
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool' | (string & {})
-  content: string
+  /** Text content, or multimodal content parts (image + text) for vision-capable models.
+   *  For text-only models, pass a plain string. Multimodal content is only supported
+   *  when the model has a vision tower (arch.vision). */
+  content: string | ContentPart[]
   /** Tool calls made on a past assistant turn (the template renders them back as <tool_call>
    *  blocks). Feed a turn's calls back verbatim from {@link ChatResult.toolCalls} when
    *  continuing a tool round trip; a `tool` role message then carries each result. */
   tool_calls?: { name: string; arguments: Record<string, unknown> | string }[]
+}
+
+/** One part of a multimodal message (text or image).
+ *  Used when `content` is an array instead of a plain string. */
+export interface ContentPart {
+  /** 'text' = plain text content; 'image' = image data for the vision tower. */
+  type: 'text' | 'image'
+  /** Text content (required when type is 'text'). */
+  text?: string
+  /** Image content (required when type is 'image').
+   *  Can be raw RGB pixel data, an ImageData object, or a URL string. */
+  image?: ImageContent
+}
+
+/** Image content for a multimodal message. */
+export interface ImageContent {
+  /** RGB pixel data, row-major, [C, H, W] layout (C=3). Values in [0, 1]. */
+  rgb?: Float32Array
+  /** Image width in pixels. */
+  width?: number
+  /** Image height in pixels. */
+  height?: number
+  /** Number of frames (1 for single image, >1 for video). Default: 1. */
+  frames?: number
+  /** Image URL (alternative to rgb — the engine fetches and decodes it). */
+  url?: string
+  /** Base64-encoded image data (alternative to rgb). */
+  base64?: string
 }
 
 /** Incremental decoder for streaming generation: feed token ids as they arrive, get the newly
@@ -63,6 +94,41 @@ export class ChatTokenizer {
    *  inserts the control tokens, so prompt/delta encoding must not add more. */
   encode(text: string, addSpecialTokens = false): number[] {
     return Array.from(this.tok.encode(text, { add_special_tokens: addSpecialTokens }).ids, Number)
+  }
+
+  /** Encode a multimodal message to token ids, inserting vision tokens around image parts.
+   *  For each image part, inserts: `<|vision_start|>` + `image_token_id` * numImageTokens + `<|vision_end|>`.
+   *  The actual image embeddings are computed separately by the engine's visionForward().
+   *  Returns the token ids and the positions of image_token_id placeholders.
+   *  Throws if the model has no vision tower (no image_token_id in the vocab). */
+  encodeMultimodal(
+    parts: ContentPart[],
+    opts: { imageTokenId?: number; visionStartId?: number; visionEndId?: number; numImageTokens?: (image: ImageContent) => number } = {},
+  ): { ids: number[]; imagePositions: number[] } {
+    const imageTokenId = opts.imageTokenId
+    const visionStartId = opts.visionStartId ?? this.tokenToId('<|vision_start|>')
+    const visionEndId = opts.visionEndId ?? this.tokenToId('<|vision_end|>')
+    const ids: number[] = []
+    const imagePositions: number[] = []
+
+    for (const part of parts) {
+      if (part.type === 'text') {
+        const textIds = this.encode(part.text ?? '')
+        for (const id of textIds) ids.push(id)
+      } else if (part.type === 'image') {
+        if (imageTokenId === undefined || visionStartId === undefined || visionEndId === undefined) {
+          throw new Error('encodeMultimodal: the model has no vision tokens (image_token_id / vision_start / vision_end)')
+        }
+        ids.push(visionStartId)
+        const n = opts.numImageTokens ? opts.numImageTokens(part.image ?? {}) : 256
+        for (let i = 0; i < n; i++) {
+          imagePositions.push(ids.length)
+          ids.push(imageTokenId)
+        }
+        ids.push(visionEndId)
+      }
+    }
+    return { ids, imagePositions }
   }
 
   /** Decode token ids to text. `skipSpecialTokens` defaults to true (never surface control tokens). */

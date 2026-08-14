@@ -16,7 +16,7 @@ import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } f
 import { makeToolFilter, parseToolCall, parseToolCallXml, ToolCallSplitter, validateTools, type ChatTool, type PreparedTools, type ToolCall, type ToolChoice } from './tools'
 
 export { ChatTokenizer } from './tokenizer'
-export type { ChatMessage, DecoderStream } from './tokenizer'
+export type { ChatMessage, DecoderStream, ContentPart, ImageContent } from './tokenizer'
 export { ThinkSplitter, StopScanner, ThinkBudget } from './think'
 export { JsonMachine, validateJsonSchema } from './json'
 export type { JsonSchema } from './json'

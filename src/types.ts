@@ -55,6 +55,47 @@ export interface ManifestArch {
    *  attention and gated full attention. Absent for the dense qwen3 models. When present, the
    *  full-attention layers use partial RoPE ({@link HybridArch.rotary_dim}) and an output gate. */
   hybrid?: HybridArch
+  /** Vision tower config (Qwen3-VL). Only present on multimodal models (Bonsai-27B).
+   *  When absent, the engine skips all vision initialization — zero cost for text-only models. */
+  vision?: VisionConfig
+}
+
+/** Qwen3-VL vision tower configuration. Only present on multimodal models (Bonsai-27B).
+ *  The vision tower is a separate ~0.63GB mmproj pack loaded only when an image arrives.
+ *  See BITGPU_VISION_TOWER_PLAN.md for the full architecture. */
+export interface VisionConfig {
+  /** Number of transformer blocks in the ViT (27 for Bonsai-27B). */
+  depth: number
+  /** ViT hidden dimension (1152). */
+  hidden_size: number
+  /** MLP intermediate dimension (4304). */
+  intermediate_size: number
+  /** Number of attention heads (16). */
+  num_heads: number
+  /** Head dimension (72 = 1152 / 16). */
+  head_dim: number
+  /** Spatial patch size (16x16 pixels per patch). */
+  patch_size: number
+  /** Temporal patch size (2 frames per temporal patch). */
+  temporal_patch_size: number
+  /** Spatial merge size — merges 2x2 patches into 1 token (2). */
+  spatial_merge_size: number
+  /** Output dimension after the patch merger, matching the LLM hidden dim (3584 → projected to LLM hidden). */
+  out_hidden_size: number
+  /** Input channels (3 = RGB). */
+  in_channels: number
+  /** Number of learned position embeddings (2304 = 48x48 grid). */
+  num_position_embeddings: number
+  /** Token ID for the image placeholder token (248056). */
+  image_token_id: number
+  /** Token ID for <|vision_start|> (248053). */
+  vision_start_token_id: number
+  /** Token ID for <|vision_end|> (248054). */
+  vision_end_token_id: number
+  /** DeepStack: ViT layers whose features are injected into early LLM layers ([8, 16, 24]). */
+  deepstack_visual_indexes?: number[]
+  /** mrope_section for the vision RoPE: [temporal_dims, height_dims, width_dims]. */
+  mrope_section?: [number, number, number]
 }
 /** The extra architecture contract for the hybrid qwen3_5 backbone. `heads`/`kv_heads`/`head_dim`
  *  on {@link ManifestArch} describe the FULL-attention layers; the linear layers are described here. */
@@ -83,6 +124,9 @@ export interface Manifest {
   arch: ManifestArch
   luts: Record<string, ManifestRef>
   tensors: Record<string, ManifestTensor>
+  /** Vision tower tensors (separate from language model tensors).
+   *  Only present when `arch.vision` is set. Loaded from the mmproj pack. */
+  visionTensors?: Record<string, ManifestTensor>
 }
 
 /** Progress event emitted while a model loads. */
@@ -131,10 +175,31 @@ export interface EngineOptions {
   forceNoSubgroups?: boolean
   /** Workgroup size for the no-subgroup reduction kernels. Default `64`. */
   noSubgroupWorkgroupSize?: number
+  /** Vision tower mmproj URL — the separate ~0.63GB pack for the Qwen3-VL vision encoder.
+   *  Only fetched when `manifest.arch.vision` is present AND an image is passed to the engine.
+   *  For text-only generation, it's never fetched. Default: derived from `modelUrl` or `dataUrl`
+   *  by replacing the filename with `Bonsai-27B-mmproj-Q8_0.gguf`. */
+  visionMmprojUrl?: string
   /** Decode steps chained per CPU sync (deferred readback). Higher hides latency; default `4`. */
   syncSteps?: number
   /** Prefill GEMM tiling: `'auto'` tiles once a prompt fills the 64-row tiles, `'always'`/`'never'` force it. Default `'auto'`. */
   prefillTiling?: 'auto' | 'always' | 'never'
+  /** Fuse RMSNorm into the decode matmul kernels (saves 2 dispatches/layer). Each matmul
+   *  workgroup redundantly computes the sum-of-squares, but eliminates the separate
+   *  rmsnorm_sg dispatch. Net win when kernel launch overhead > redundant compute.
+   *  Default `false` (opt-in for benchmarking). Decode-only; prefill path unchanged. */
+  fusedDecode?: boolean
+  /** Run a dummy decode step during load to force GPU driver JIT compilation of all
+   *  pipeline state objects. The first real decode token skips the driver's lazy native
+   *  shader compilation, reducing TTFT. Mirrors the diffusion pipeline's "pre-run a tiny
+   *  dummy textToImage to force shader JIT" pattern. Default `false` (opt-in).
+   *  Cost: ~50-100ms during load (one decode step + readback + cache reset). */
+  warmShaders?: boolean
+  /** Merge the 3 post-QKV-matmul dispatches (Q norm+RoPE, K norm+RoPE+cache write,
+   *  V cache write) into a single dispatch. Saves 2 dispatches per layer (56 for 28
+   *  layers). Consumer merge — no redundant compute. kv8 cache + subgroup path only.
+   *  Default `false` (opt-in for benchmarking). Decode-only; prefill path unchanged. */
+  fusedQKV?: boolean
   /** Max KV-cache length (prompt + generated positions). Caps VRAM (~`maxSeqLen` x 224 KB at f32,
    *  half that with `kvCache: 'f16'`, ~a quarter with `'q8'`). Default `2048`. Capped by the
    *  model's RoPE range: the baked cache length for ONNX-derived manifests, `max_positions`
@@ -175,6 +240,21 @@ export interface EngineOptions {
   /** Number of initial attention-sink positions kept forever under `overflow: 'sinks'`.
    *  Default `4` (the StreamingLLM setting). */
   sinkTokens?: number
+  /** Use GPU-side dequantization for Q1_0 weights instead of CPU-side per-byte
+   *  transforms. Uploads raw GGUF bytes via writeBuffer (no CPU processing),
+   *  then dispatches a compute shader to expand into the codes/signs + scales
+   *  format the matmul kernels expect. ~2x faster weight upload. Default `false`. */
+  gpuDequant?: boolean
+  /** Batch all raw weight uploads into a single large writeBuffer call, then
+   *  distribute to individual tensor buffers via GPU-side copyBufferToBuffer.
+   *  Eliminates per-chunk writeBuffer IPC/shmem overhead (~3700 calls → 1).
+   *  Requires gpuDequant. ~3-5x faster on top of gpuDequant. Default `false`. */
+  batchUpload?: boolean
+  /** Create raw weight buffers with mappedAtCreation and write directly into
+   *  the mapped range instead of calling writeBuffer per chunk. On Apple Silicon
+   *  UMA this can skip the staging buffer copy entirely. Requires gpuDequant.
+   *  Default `false`. */
+  mappedUpload?: boolean
   /** Called as the model loads. */
   onProgress?: (progress: LoadProgress) => void
   /** Called if the GPU device is lost after creation (driver reset, OS reclaim, tab backgrounding
@@ -334,6 +414,37 @@ export interface ForwardResult {
   sequenceLength: number
 }
 
+/** Image input for the vision tower. The image is preprocessed on CPU
+ *  (resized to a multiple of patch_size, converted to RGB float tensor)
+ *  before being passed to the engine. */
+export interface ImageInput {
+  /** RGB pixel data, row-major, [C, H, W] layout (C=3).
+   *  Values normalized to [0, 1] (pixel / 255). */
+  rgb: Float32Array
+  /** Image width in pixels (must be a multiple of patch_size * spatial_merge_size). */
+  width: number
+  /** Image height in pixels (must be a multiple of patch_size * spatial_merge_size). */
+  height: number
+  /** Number of frames (1 for single image, >1 for video). Default: 1. */
+  frames?: number
+}
+
+/** Result of {@link Engine.visionForward}: image embeddings ready to insert
+ *  into the token sequence, plus DeepStack features for early LLM layer injection. */
+export interface VisionForwardResult {
+  /** Final image embeddings [num_merged_patches, out_hidden_size].
+   *  These replace the image_token_id positions in the token embedding sequence. */
+  imageEmbeds: Float32Array
+  /** Number of merged patches (= imageEmbeds.length / out_hidden_size). */
+  numPatches: number
+  /** DeepStack features from ViT layers [8, 16, 24].
+   *  Each entry is [num_merged_patches, out_hidden_size].
+   *  Injected into LLM layers 0, 1, 2 respectively. Empty if DeepStack is not used. */
+  deepstackFeatures: Float32Array[]
+  /** Time taken in milliseconds. */
+  elapsedMs: number
+}
+
 /** What the engine detected about the host GPU and which code path it selected. */
 export interface EngineCapabilities {
   /** Whether the fast subgroup path is in use (false = the workgroup-reduction fallback). */
@@ -400,6 +511,19 @@ export interface Engine {
   prefill(promptTokenIds: number[]): Promise<{ prefillMs: number }>
   /** Run a single forward pass and return hidden states + logits (diagnostic / correctness checks). */
   forward(tokenIds: number[]): Promise<ForwardResult>
+  /** Run the vision tower on one or more images and return image embeddings + DeepStack features.
+   *  Throws if the model has no vision tower (`arch.vision` is undefined).
+   *  The mmproj pack is loaded lazily on first call (if not already loaded). */
+  visionForward?(images: ImageInput[]): Promise<VisionForwardResult>
+  /** Multimodal generate: run the vision tower on `images`, inject the resulting embeddings
+   *  at `imagePositions` in the token sequence (the `image_token_id` placeholder positions),
+   *  then decode as normal. The vision tower's projection_dim must match the LLM hidden_size
+   *  (it does for Bonsai-27B: both are 5120). Throws if the model has no vision tower.
+   *  `imagePositions` must be sorted ascending and each < promptTokenIds.length. */
+  generateWithImages?(promptTokenIds: number[], imagePositions: number[], images: ImageInput[], options?: GenerateOptions): Promise<GenerateResult>
+  /** Whether the model has a vision tower loaded and ready. `false` for text-only models
+   *  (1.7B/4B/8B) and for the 27B before the mmproj pack is fetched. */
+  readonly vision?: boolean
   /** Clear the cross-turn KV cache and token history (start a fresh conversation). */
   resetCache(): void
   /** Snapshot the current conversation - KV cache contents + token history - as a

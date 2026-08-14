@@ -1,5 +1,20 @@
 export { createEngine } from './engine'
 export { GpuOutOfMemoryError, WebGPUUnavailableError } from './errors'
+export {
+  preprocessImage,
+  computeVisionPosEmbed,
+  computeVisionPositionIds,
+  computeVisionRoPE,
+  computeCuSeqlens,
+  numImageTokens,
+  createVisionState,
+  loadVisionWeights,
+  visionForwardCpu,
+  dequantQ8_0,
+  dequantF16,
+  parseGgufHeader,
+  visionConfigFromMmproj,
+} from './vision'
 export type {
   DeviceLostInfo,
   Engine,
@@ -8,6 +23,7 @@ export type {
   GenerateOptions,
   GenerateResult,
   ForwardResult,
+  ImageInput,
   KvSnapshot,
   LoadProgress,
   Manifest,
@@ -15,4 +31,6 @@ export type {
   ManifestRef,
   ManifestTensor,
   TokenLogprobs,
+  VisionConfig,
+  VisionForwardResult,
 } from './types'

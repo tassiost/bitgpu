@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>bitgpu - end-to-end multimodal vision test</title>
+  <style>
+    body { font-family: monospace; margin: 20px; background: #1a1a2e; color: #e0e0e0; }
+    h1 { color: #0ff; }
+    pre { background: #0d0d1a; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; }
+    input, button, select { font-family: monospace; padding: 4px 8px; margin: 2px; }
+    button { cursor: pointer; background: #16213e; color: #e0e0e0; border: 1px solid #0ff; border-radius: 4px; }
+    button:hover { background: #0f3460; }
+    .prompt { width: 80%; }
+  </style>
+</head>
+<body>
+  <h1>bitgpu - end-to-end multimodal test (vision + LLM)</h1>
+  <p>Runs the full pipeline: synthetic image → vision tower → image embeddings → LLM prefill → text generation.</p>
+  <p>
+    Model: <input id="modelUrl" size="60" value="" placeholder="http://localhost:8888/Bonsai-27B-Q1_0.gguf" /><br/>
+    Mmproj: <input id="mmprojUrl" size="60" value="" placeholder="http://localhost:8888/Bonsai-27B-mmproj-Q8_0.gguf" /><br/>
+    Tokenizer JSON: <input id="tokenizerJson" size="60" value="" placeholder="http://localhost:8888/tokenizer.json" /><br/>
+    Tokenizer Config: <input id="tokenizerConfig" size="60" value="" placeholder="http://localhost:8888/tokenizer_config.json" /><br/>
+    Image: <select id="imageSelect">
+      <option value="synthetic-red">Synthetic 32x32 red</option>
+      <option value="synthetic-gradient">Synthetic 64x64 gradient</option>
+      <option value="synthetic-noise">Synthetic 128x128 noise</option>
+      <option value="file">PNG file (URL below)</option>
+    </select>
+    <input id="imageUrl" size="60" value="" placeholder="http://localhost:8888/test-screenshot.png" /><br/>
+    Prompt: <input id="prompt" class="prompt" value="What do you see in this image?" />
+  </p>
+  <button id="run">Run end-to-end test</button>
+  <pre id="out">idle.</pre>
+
+  <script type="module">
+    import { createEngine } from '../dist/index.js';
+    import { fromGguf } from '../dist/gguf.js';
+    import { createChat } from '../dist/chat.js';
+
+    const out = document.getElementById('out');
+    const log = (...args) => { out.textContent += args.join(' ') + '\n'; };
+
+    // Auto-fill from URL params
+    const params = new URLSearchParams(location.search);
+    if (params.get('model')) document.getElementById('modelUrl').value = params.get('model');
+    if (params.get('mmproj')) document.getElementById('mmprojUrl').value = params.get('mmproj');
+    if (params.get('tokenizerJson')) document.getElementById('tokenizerJson').value = params.get('tokenizerJson');
+    if (params.get('tokenizerConfig')) document.getElementById('tokenizerConfig').value = params.get('tokenizerConfig');
+    if (params.get('image')) document.getElementById('imageSelect').value = params.get('image');
+    if (params.get('imageUrl')) document.getElementById('imageUrl').value = params.get('imageUrl');
+    if (params.get('prompt')) document.getElementById('prompt').value = params.get('prompt');
+
+    async function makeImage(type, imageUrl) {
+      if (type === 'synthetic-red') {
+        const w = 32, h = 32;
+        const rgb = new Float32Array(3 * w * h);
+        for (let i = 0; i < w * h; i++) { rgb[i*3] = 1.0; rgb[i*3+1] = 0.0; rgb[i*3+2] = 0.0; }
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+      if (type === 'synthetic-gradient') {
+        const w = 64, h = 64;
+        const rgb = new Float32Array(3 * w * h);
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+          const i = (y * w + x) * 3;
+          rgb[i] = x / w; rgb[i+1] = y / h; rgb[i+2] = (x + y) / (w + h);
+        }
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+      if (type === 'synthetic-noise') {
+        const w = 128, h = 128;
+        const rgb = new Float32Array(3 * w * h);
+        let seed = 42;
+        const rng = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
+        for (let i = 0; i < 3 * w * h; i++) rgb[i] = rng();
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+      if (type === 'file') {
+        // Load PNG via Image → canvas → Float32Array RGB [0,1]
+        const url = imageUrl || 'http://localhost:8888/test-screenshot.png';
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        await new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = reject;
+          img.src = url;
+        });
+        const w = img.naturalWidth, h = img.naturalHeight;
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0);
+        const imageData = ctx.getImageData(0, 0, w, h);
+        // Convert RGBA → RGB Float32Array [0,1]
+        const rgb = new Float32Array(3 * w * h);
+        for (let i = 0; i < w * h; i++) {
+          rgb[i*3]   = imageData.data[i*4]   / 255;
+          rgb[i*3+1] = imageData.data[i*4+1] / 255;
+          rgb[i*3+2] = imageData.data[i*4+2] / 255;
+        }
+        return { rgb, width: w, height: h, frames: 1 };
+      }
+    }
+
+    document.getElementById('run').onclick = async () => {
+      out.textContent = '';
+      try {
+        const modelUrl = document.getElementById('modelUrl').value;
+        const mmprojUrl = document.getElementById('mmprojUrl').value;
+        const tokenizerJsonUrl = document.getElementById('tokenizerJson').value;
+        const tokenizerConfigUrl = document.getElementById('tokenizerConfig').value;
+        const imageType = document.getElementById('imageSelect').value;
+        const promptText = document.getElementById('prompt').value;
+        const imageUrl = document.getElementById('imageUrl').value;
+        const image = await makeImage(imageType, imageUrl);
+
+        if (!modelUrl || !mmprojUrl || !tokenizerJsonUrl || !tokenizerConfigUrl) {
+          log('ERROR: Please provide all URLs (model, mmproj, tokenizer JSON, tokenizer config)');
+          return;
+        }
+
+        // 1. Create GPU engine
+        log('1. Creating GPU engine from GGUF...');
+        const t0 = performance.now();
+        const parsed = await fromGguf(modelUrl);
+        const engine = await createEngine({
+          ...parsed,
+          visionMmprojUrl: mmprojUrl,
+          warmShaders: false,
+        });
+        log(`   Engine created in ${(performance.now() - t0).toFixed(0)}ms`);
+        log(`   Vision support: ${engine.vision}`);
+
+        if (!engine.visionForward || !engine.generateWithImages) {
+          log('ERROR: Engine has no vision support');
+          return;
+        }
+
+        // 2. Create chat (tokenizer + chat template)
+        log('\n2. Loading tokenizer...');
+        const t1 = performance.now();
+        const chat = await createChat(engine, {
+          tokenizerJsonUrl,
+          tokenizerConfigUrl,
+        });
+        log(`   Tokenizer loaded in ${(performance.now() - t1).toFixed(0)}ms`);
+        const tk = chat.tokenizer;
+        log(`   EOS token id: ${tk.eosTokenId}`);
+        log(`   Has chat template: ${tk.hasChatTemplate}`);
+
+        // 3. Run vision tower to get numMerged (number of image embeddings)
+        log('\n3. Running vision tower to determine image token count...');
+        const t2 = performance.now();
+        const visResult = await engine.visionForward([image]);
+        const numMerged = visResult.numPatches;
+        log(`   Vision tower: ${numMerged} image embeddings in ${(performance.now() - t2).toFixed(0)}ms`);
+        log(`   Embedding dims: ${visResult.imageEmbeds.length / numMerged}`);
+
+        // 4. Build the multimodal prompt using the chat tokenizer
+        log('\n4. Building multimodal prompt...');
+        const messages = [
+          { role: 'user', content: [
+            { type: 'image', image },
+            { type: 'text', text: promptText },
+          ] },
+        ];
+        // Use encodeMultimodal to get token IDs + image positions
+        const imageTokenId = 248056;   // <|image_pad|>
+        const visionStartId = 248053;  // <|vision_start|>
+        const visionEndId = 248054;    // <|vision_end|>
+        const { ids: rawIds, imagePositions } = tk.encodeMultimodal(
+          messages.flatMap(m => m.content),
+          { imageTokenId, visionStartId, visionEndId, numImageTokens: () => numMerged },
+        );
+        log(`   Token sequence: ${rawIds.length} tokens, ${imagePositions.length} image positions`);
+
+        // Apply chat template to get the full prompt, then encode
+        // Actually, encodeMultimodal doesn't apply the chat template. We need to
+        // build the prompt manually: apply chat template with text only, then
+        // insert image tokens at the right place.
+        // Simpler: use the chat template to get the prompt string, then manually
+        // build the token sequence.
+        const promptString = tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: false });
+        log(`   Chat template output: ${promptString.length} chars`);
+
+        // Tokenize the prompt string (without image), then find where to insert image tokens.
+        // Actually, the chat template will include <|vision_start|><|image_pad|>...<|vision_end|>
+        // tokens if the template handles images. Let's just encode the full prompt string.
+        const promptIds = tk.encode(promptString, false);
+        log(`   Encoded prompt: ${promptIds.length} tokens`);
+
+        // Find image_token_id positions in the encoded prompt.
+        // The Qwen3-VL chat template emits a single <|image_pad|> placeholder between
+        // <|vision_start|> and <|vision_end|>. We need to expand it into numMerged copies
+        // so the vision embeddings can be injected at each position.
+        const imgPositions = [];
+        for (let i = 0; i < promptIds.length; i++) {
+          if (promptIds[i] === imageTokenId) imgPositions.push(i);
+        }
+        log(`   Found ${imgPositions.length} image_token_id position(s) in encoded prompt (need ${numMerged})`);
+
+        // Expand the single <|image_pad|> into numMerged copies.
+        // The chat template produces: [..., vision_start, image_pad, vision_end, ...]
+        // We transform it to:         [..., vision_start, image_pad × numMerged, vision_end, ...]
+        let finalIds = promptIds;
+        let finalImgPositions = imgPositions;
+        if (imgPositions.length === 1 && numMerged > 1) {
+          const padPos = imgPositions[0];
+          const expanded = new Array(numMerged).fill(imageTokenId);
+          finalIds = [
+            ...promptIds.slice(0, padPos),
+            ...expanded,
+            ...promptIds.slice(padPos + 1),
+          ];
+          finalImgPositions = [];
+          for (let i = 0; i < numMerged; i++) finalImgPositions.push(padPos + i);
+          log(`   Expanded <|image_pad|> ×${numMerged} at position ${padPos} → ${finalIds.length} tokens`);
+        } else if (imgPositions.length !== numMerged) {
+          log(`   ERROR: cannot reconcile ${imgPositions.length} image positions with ${numMerged} embeddings`);
+          log(`   FATAL: image position count mismatch`);
+          return;
+        }
+
+        // 5. Generate with images
+        log('\n5. Generating response...');
+        const t3 = performance.now();
+        const result = await engine.generateWithImages(finalIds, finalImgPositions, [image], {
+          maxTokens: 128,
+          temperature: 0.3,
+          repetitionPenalty: 1.1,
+          noRepeatNgramSize: 3,
+        });
+        const genMs = performance.now() - t3;
+        log(`   Generation: ${result.tokens.length} tokens in ${genMs.toFixed(0)}ms`);
+        log(`   Prefill: ${result.prefillMs?.toFixed(0)}ms, Decode: ${result.decodeMs?.toFixed(0)}ms`);
+        log(`   Tokens/s: ${result.tokensPerSecond?.toFixed(1)}`);
+
+        // 6. Decode the response
+        const response = tk.decode(result.tokens, true);
+        log('\n=== LLM RESPONSE ===');
+        log(response);
+        log('=== END ===');
+
+      } catch (e) {
+        log(`\nFATAL: ${e.message}`);
+        log(e.stack || '');
+      }
+    };
+
+    // Auto-run if run=1 in URL
+    if (params.get('run') === '1') {
+      setTimeout(() => document.getElementById('run').click(), 100);
+    }
+  </script>
+</body>
+</html>

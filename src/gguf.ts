@@ -70,6 +70,7 @@ interface Header {
 }
 
 function u64ToNumber(v: bigint, what: string): number {
+  if (v < 0n) throw new Error(`bitgpu/gguf: ${what} ${v} is negative (invalid for u64)`)
   if (v > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error(`bitgpu/gguf: ${what} ${v} exceeds safe integer range`)
   return Number(v)
 }
