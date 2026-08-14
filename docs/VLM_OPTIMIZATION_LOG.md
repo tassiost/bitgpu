@@ -83,7 +83,43 @@ image resizing, which is the likely cause of poor text recognition.
 
 **Files**: `src/vision.ts` line 560
 
-### 4. Previous optimizations (commit e177133)
+### 4. Q8_0 in-shader dequantization (P3 — WEIGHT BANDWIDTH REDUCTION)
+
+**Problem**: Vision weights were dequantized from Q8_0 to f32 on CPU, then
+uploaded as f32 buffers. Total weight reads: 60.8 MB per layer (f32).
+At ~100 GB/s (M3), theoretical min is ~15ms/layer, actual ~1260ms — 84× gap.
+
+**Fix**: Repack Q8_0 weights on CPU into GPU-friendly format:
+- `packed: Uint32Array` — [N, K/4] u32 words, each containing 4 int8 values
+- `scales: Float32Array` — [N, K/32] f32 block scales
+
+New Q8 matmul shaders (`vision_matmul_q8`, `vision_matmul_q8_gelu`,
+`vision_matmul_q8_add`) dequantize inline during the dot product:
+```wgsl
+let bits = i32(packed_word);
+let v0 = f32((bits << 24) >> 24) * scale;  // extract signed int8, multiply by scale
+```
+
+This follows the proven pattern from the LLM engine's q8 KV cache
+(`attention_sg_kv8.wgsl`), adapted for vision matmul weights.
+
+**Weight bandwidth reduction**:
+| Weight | f32 size | Q8 packed + scales | Reduction |
+|--------|----------|-------------------|-----------|
+| QKV [3456, 1152] | 15.9 MB | 5.0 MB | 3.2× |
+| attn_out [1152, 1152] | 5.3 MB | 1.4 MB | 3.8× |
+| ffn_up [4304, 1152] | 19.8 MB | 5.8 MB | 3.4× |
+| ffn_down [1152, 4304] | 19.8 MB | 19.8 MB (F16, still f32) | 1.0× |
+| **Total per layer** | **60.8 MB** | **32.0 MB** | **1.9×** |
+
+**Files**: `src/vision.ts` (repackQ8_0, Q8PackedWeight type), `shaders/vision_matmul_q8*.wgsl` (new), `src/engine.ts` (dual buffer upload, Q8 shader dispatch)
+
+**Results**: Vision tower 33.9s → 31.1s (8% faster). Accuracy preserved.
+Improvement limited because ffn_down (biggest weight, 19.8 MB) is F16 not
+Q8_0 — still uploaded as f32. Keeping it as f16 on GPU would add another
+~2× on that weight (P4 below).
+
+### 5. Previous optimizations (commit e177133)
 
 Already implemented before this session:
 1. Compact patch embedding for still images (sum temporal weights → 768-dim)
@@ -141,40 +177,32 @@ Already implemented before this session:
 
 ## Future Optimization Opportunities
 
-### P3: Q8_0 in-shader dequantization (BIGGEST WIN)
+### P3: Q8_0 in-shader dequantization — DONE (see Completed Optimizations #4)
 
-**Analysis**: The vision tower is memory-bandwidth bound, not compute bound.
-Total weight reads per layer: 55.5 MB (f32). At ~100 GB/s (M3 unified memory),
-theoretical minimum is ~15ms per layer, but actual is ~1260ms — 84× slower.
+### P4: F16 storage for FFN down weights (NEXT BIGGEST WIN)
 
-The weights are currently dequantized from Q8_0 to f32 on CPU during load,
-then uploaded as f32 buffers. If we kept them as Q8_0 and dequantized in the
-shader, weight buffers would be 4× smaller:
-- QKV: 15.9 MB → 4.2 MB
-- FFN up: 19.8 MB → 5.2 MB
-- FFN down: 19.8 MB → 5.2 MB
-- Total per layer: 55.5 MB → 14.6 MB
-- Total 27 layers: 1.5 GB → 394 MB
+FFN down is the largest vision weight (19.8 MB/layer, [1152, 4304]) and is
+stored as F16 in the GGUF file. Currently it's converted to f32 on CPU and
+uploaded as f32. Keeping it as f16 on GPU would:
+- Reduce weight bandwidth: 19.8 MB → 9.9 MB per layer (2× reduction)
+- Total weight bandwidth: 32.0 MB → 22.1 MB per layer (1.45× further reduction)
+- Requires `shader-f16` feature (Apple Silicon supports it natively)
+- The LLM engine already uses f16 storage for KV cache (attention_sg_kv16.wgsl)
 
-This would dramatically reduce memory bandwidth pressure. Each Q8_0 block
-is 34 bytes (2-byte f16 scale + 32 int8 values). The shader reads the scale,
-then multiplies each int8 value by it.
+**Challenge**: Need a new `vision_matmul_f16_add.wgsl` shader that reads
+`array<f16>` weights. The `enable f16;` directive and `shader-f16` feature
+are needed. Fall back to f32 if the adapter doesn't support f16.
 
-**Challenge**: Requires rewriting all matmul shaders to handle Q8_0 layout.
-The weight buffer binding changes from `array<f32>` to `array<u32>` (packed
-Q8_0 blocks). Each thread reads its Q8_0 block, dequantizes to f32, then
-does the dot product.
-
-### P4: f16 storage for vision activations
+### P4b: f16 storage for vision activations
 
 All activation buffers use f32 (4 bytes). Using f16 would halve memory
 bandwidth for activations. Apple Silicon has native f16 support (Metal).
 Requires `shader-f16` feature. Vision tower activations can tolerate f16
 precision (CLIP ViT models run successfully with f16 on WebGPU).
 
-**Note**: Weight bandwidth (55.5 MB/layer) dominates activation bandwidth
-(~9.4 MB/layer), so P3 (Q8_0 dequant) is more impactful than P4 (f16
-activations). Doing both would be ideal.
+**Note**: Weight bandwidth (32.0 MB/layer with Q8) still dominates activation
+bandwidth (~9.4 MB/layer), so P4 (f16 FFN down) is more impactful than P4b
+(f16 activations). Doing both would be ideal.
 
 ### P5: 2D tiling for matmul
 
@@ -265,3 +293,16 @@ barrier overhead can exceed the saved memory traffic.
 - Findings documented above in "What DIDN'T work" section
 - Kept: documentation comments in shaders explaining why these approaches
   don't work on Apple Silicon SIMD architecture
+
+### 2025-01-XX: Q8_0 in-shader dequantization
+- Status: COMPLETE
+- Files changed:
+  - `src/vision.ts` (repackQ8_0(), Q8PackedWeight type, Q8 packed weight loading)
+  - `shaders/vision_matmul_q8.wgsl` (new — Q8 matmul with split outputs)
+  - `shaders/vision_matmul_q8_gelu.wgsl` (new — Q8 matmul + GELU)
+  - `shaders/vision_matmul_q8_add.wgsl` (new — Q8 matmul + residual add)
+  - `src/engine.ts` (dual buffer upload, Q8 shader dispatch, skip f32 for Q8 weights)
+- Results: Vision tower 33.9s → 31.1s (8% faster), accuracy preserved
+- Weight bandwidth: 60.8 MB/layer → 32.0 MB/layer (1.9× reduction)
+- Pattern: Follows LLM engine's q8 KV cache (attention_sg_kv8.wgsl) —
+  packed u32 words + f32 block scales, dequantized inline via bit shifts
