@@ -545,7 +545,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     for (const n of ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
                       'vision_matmul_tiled_add', 'vision_matmul_q8', 'vision_matmul_q8_gelu',
                       'vision_matmul_q8_add', 'vision_matmul_q8_tiled', 'vision_matmul_q8_tiled_gelu',
-                      'vision_matmul_q8_tiled_add', 'vision_matmul_f16_add',
+                      'vision_matmul_q8_tiled_add', 'vision_matmul_f16_add', 'vision_matmul_f16_tiled_add',
                       'vision_layernorm', 'vision_gelu', 'vision_add',
                       'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
                       'vision_apply_rope', 'vision_inject'])
@@ -3689,18 +3689,20 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           pass.dispatchWorkgroups(Math.ceil(inter / 64))
         }
 
-        // 7. FFN down + residual add — f16 weight if available, else f32
+        // 7. FFN down + residual add — 2D tiled f16 if available, else f32
         //    h0 = h1 + matmul(act, ffnDownW, ffnDownB)
         if (vw.get(p + 'ffnDownWF16')) {
-          setup(pass, 'vision_matmul_f16_add',
+          setup(pass, 'vision_matmul_f16_tiled_add',
             [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
             [actBuf_, vw.get(p + 'ffnDownWF16')!, vw.get(p + 'ffnDownB')!],
             [h0, h1])
+          pass.dispatchWorkgroups(Math.ceil(H / 64), Math.ceil(numPatches / 64))
         } else {
           setup(pass, 'vision_matmul_tiled_add',
             [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
             [actBuf_, vw.get(p + 'ffnDownW')!, vw.get(p + 'ffnDownB')!],
             [h0, h1])
+          pass.dispatchWorkgroups(Math.ceil(H / 64))
         }
         pass.dispatchWorkgroups(Math.ceil(H / 64))
 
