@@ -52,6 +52,50 @@ export function dequantQ8_0(data: Uint8Array, N: number, K: number): Float32Arra
   return out
 }
 
+/** Repack Q8_0 data into GPU-friendly format for in-shader dequantization.
+ *  Returns two arrays:
+ *  - packed: [N, K/4] u32 words, each containing 4 int8 values (little-endian)
+ *  - scales: [N, K/32] f32 values, one scale per 32-element block
+ *
+ *  The shader reads packed words and scales, dequantizes inline:
+ *    value = f32(int8_value) * scale
+ *
+ *  This is the same pattern as the LLM engine's q8 KV cache (copy_kv8.wgsl),
+ *  which uses unpack4x8snorm + block scales. Here we use raw int8 extraction
+ *  via bit shifts (i32 sign-extends) since GGUF Q8_0 uses int8, not snorm8.
+ *
+ *  Weight bandwidth: K bytes/row (packed) + K/8 bytes/row (scales) = 1.125K
+ *  vs 4K for f32 — 3.56x reduction. */
+export function repackQ8_0(
+  data: Uint8Array, N: number, K: number,
+): { packed: Uint32Array, scales: Float32Array } {
+  const blocksPerRow = K / 32
+  const packed = new Uint32Array(N * (K / 4))   // 8 u32 words per block
+  const scales = new Float32Array(N * blocksPerRow)
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
+
+  for (let row = 0; row < N; row++) {
+    for (let blk = 0; blk < blocksPerRow; blk++) {
+      const blockOff = (row * blocksPerRow + blk) * Q8_0_BLOCK_SIZE
+      // f16 scale → f32
+      scales[row * blocksPerRow + blk] = f16ToF32(dv.getUint16(blockOff, true))
+      // 32 int8 values → 8 u32 words (reinterpret bytes as little-endian u32)
+      for (let w = 0; w < 8; w++) {
+        packed[row * (K / 4) + blk * 8 + w] = dv.getUint32(blockOff + 2 + w * 4, true)
+      }
+    }
+  }
+  return { packed, scales }
+}
+
+/** A Q8_0 weight tensor repacked for GPU in-shader dequantization. */
+export interface Q8PackedWeight {
+  packed: Uint32Array   // [N, K/4] u32 words (4 int8 per word)
+  scales: Float32Array  // [N, K/32] f32 block scales
+  N: number             // output features
+  K: number             // input features
+}
+
 /** Convert IEEE 754 half-precision (f16) bits to f32. */
 function f16ToF32(bits: number): number {
   const sign = (bits >> 15) & 1
@@ -238,13 +282,14 @@ async function readTensorBytes(
   return new Uint8Array(await res.arrayBuffer())
 }
 
-/** Load and dequantize a single tensor from the mmproj file. */
+/** Load and dequantize a single tensor from the mmproj file.
+ *  For Q8_0 tensors, also returns the raw bytes and type for GPU repacking. */
 async function loadTensor(
   url: string,
   tensor: GgufTensor,
   dataStart: number,
   fetchRange?: (url: string, off: number, len: number) => Promise<ArrayBuffer>,
-): Promise<VisionWeight> {
+): Promise<VisionWeight & { raw?: Uint8Array, type?: number }> {
   const raw = await readTensorBytes(url, tensor, dataStart, fetchRange)
   // GGUF dims are [ne0, ne1, ...] where ne0 is innermost.
   // For a 2D weight matrix [in, out], we want [out, in] for matmul.
@@ -268,7 +313,8 @@ async function loadTensor(
       const N = dims.length >= 2 ? dims[1] : 1  // out_features (ne1)
       const K = dims[0]  // in_features (ne0)
       data = dequantQ8_0(raw, N, K)
-      break
+      // Keep raw bytes + type for GPU repacking (avoids re-fetching)
+      return { name: tensor.name, data, dims, raw, type: GGUF_Q8_0 }
     }
     default:
       throw new Error(`Tensor ${tensor.name}: unsupported type ${tensor.type}`)
@@ -298,6 +344,8 @@ export interface VisionWeights {
   mergerMm0Bias: Float32Array    // [4608]
   mergerMm2Weight: Float32Array  // [5120, 4608]
   mergerMm2Bias: Float32Array    // [5120]
+  // Q8 packed weights for GPU in-shader dequantization (null if not Q8_0)
+  q8: VisionQ8Weights | null
 }
 
 interface VisionLayerWeights {
@@ -313,6 +361,21 @@ interface VisionLayerWeights {
   ffnUpBias: Float32Array   // [4304]
   ffnDownWeight: Float32Array  // [1152, 4304]
   ffnDownBias: Float32Array    // [1152]
+}
+
+/** Q8_0 packed weights for GPU in-shader dequantization.
+ *  Each field is null if the weight is not Q8_0 (e.g., ffn_down is F16). */
+export interface VisionQ8Weights {
+  layers: Q8LayerWeights[]
+  mergerMm0: Q8PackedWeight | null  // [4608, 4608]
+  mergerMm2: Q8PackedWeight | null  // [5120, 4608]
+}
+
+interface Q8LayerWeights {
+  qkv: Q8PackedWeight       // [3456, 1152]
+  attnOut: Q8PackedWeight   // [1152, 1152]
+  ffnUp: Q8PackedWeight     // [4304, 1152]
+  // ffnDown is F16, not Q8_0 — no packed version
 }
 
 /** Load all vision tower weights from the mmproj GGUF file.
@@ -406,6 +469,7 @@ export async function loadVisionWeights(
 
   // Per-layer weights
   const layers: VisionLayerWeights[] = []
+  const q8Layers: Q8LayerWeights[] = []
   for (let li = 0; li < depth; li++) {
     const ln1W = await get(`v.blk.${li}.ln1.weight`)
     const ln1B = await get(`v.blk.${li}.ln1.bias`)
@@ -441,6 +505,23 @@ export async function loadVisionWeights(
       ffnDownWeight: ffnDownData,  // [1152, 4304] (transposed)
       ffnDownBias: ffnDownB.data,  // [1152]
     })
+
+    // Repack Q8_0 weights for GPU in-shader dequantization
+    // Q8_0 weights: qkv, attn_out, ffn_up (ffn_down is F16)
+    const qkvDims = qkvW.dims
+    const qkvN = qkvDims.length >= 2 ? qkvDims[1] : 1
+    const qkvK = qkvDims[0]
+    const attnDims = attnOutW.dims
+    const attnN = attnDims.length >= 2 ? attnDims[1] : 1
+    const attnK = attnDims[0]
+    const ffnUpDims = ffnUpW.dims
+    const ffnUpN = ffnUpDims.length >= 2 ? ffnUpDims[1] : 1
+    const ffnUpK = ffnUpDims[0]
+    q8Layers.push({
+      qkv: repackQ8_0(qkvW.raw!, qkvN, qkvK),
+      attnOut: repackQ8_0(attnOutW.raw!, attnN, attnK),
+      ffnUp: repackQ8_0(ffnUpW.raw!, ffnUpN, ffnUpK),
+    })
   }
 
   // Patch merger
@@ -448,6 +529,18 @@ export async function loadVisionWeights(
   const mm0B = await get('mm.0.bias')
   const mm2W = await get('mm.2.weight')
   const mm2B = await get('mm.2.bias')
+
+  // Repack merger weights if Q8_0
+  let q8Mm0: Q8PackedWeight | null = null
+  let q8Mm2: Q8PackedWeight | null = null
+  if (mm0W.type === GGUF_Q8_0 && mm0W.raw) {
+    const d = mm0W.dims
+    q8Mm0 = repackQ8_0(mm0W.raw, d.length >= 2 ? d[1] : 1, d[0])
+  }
+  if (mm2W.type === GGUF_Q8_0 && mm2W.raw) {
+    const d = mm2W.dims
+    q8Mm2 = repackQ8_0(mm2W.raw, d.length >= 2 ? d[1] : 1, d[0])
+  }
 
   const weights: VisionWeights = {
     patchEmbdWeight,  // [1536, 1152] = [in, out] — wait, we built it as [out, in]
@@ -461,6 +554,7 @@ export async function loadVisionWeights(
     mergerMm0Bias: mm0B.data,
     mergerMm2Weight: mm2W.data,  // [5120, 4608]
     mergerMm2Bias: mm2B.data,
+    q8: { layers: q8Layers, mergerMm0: q8Mm0, mergerMm2: q8Mm2 },
   }
 
   return { weights, config }

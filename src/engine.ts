@@ -540,7 +540,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   if (visionState) {
     // All vision shaders use fixed @workgroup_size — no overrides needed
     for (const n of ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
-                      'vision_matmul_tiled_add', 'vision_layernorm', 'vision_gelu', 'vision_add',
+                      'vision_matmul_tiled_add', 'vision_matmul_q8', 'vision_matmul_q8_gelu',
+                      'vision_matmul_q8_add', 'vision_layernorm', 'vision_gelu', 'vision_add',
                       'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
                       'vision_apply_rope', 'vision_inject'])
       specs.push([n])
@@ -3396,6 +3397,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           device.queue.writeBuffer(b, 0, copy.buffer, 0, copy.byteLength)
           return b
         }
+        // Upload packed Q8 weight (two buffers: packed u32 words + f32 scales)
+        const upQ8 = (pw: { packed: Uint32Array, scales: Float32Array }): { packed: GPUBuffer, scales: GPUBuffer } => {
+          const pBuf = device.createBuffer({ size: pw.packed.byteLength, usage: S_ | CD | CS })
+          device.queue.writeBuffer(pBuf, 0, pw.packed.buffer, pw.packed.byteOffset, pw.packed.byteLength)
+          const sBuf = device.createBuffer({ size: pw.scales.byteLength, usage: S_ | CD | CS })
+          device.queue.writeBuffer(sBuf, 0, pw.scales.buffer, pw.scales.byteOffset, pw.scales.byteLength)
+          return { packed: pBuf, scales: sBuf }
+        }
         const vb = visionState!.buffers
         vb.set('patchEmbdWeight', up(vw.patchEmbdWeight))
         vb.set('patchEmbdWeightCompact', up(vw.patchEmbdWeightCompact))
@@ -3403,25 +3412,67 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         vb.set('positionEmbd', up(vw.positionEmbd))
         vb.set('postLnWeight', up(vw.postLnWeight))
         vb.set('postLnBias', up(vw.postLnBias))
-        vb.set('mm0Weight', up(vw.mergerMm0Weight))
+        // Merger weights: upload Q8 if available, else f32
+        if (vw.q8?.mergerMm0) {
+          const mm0Q8 = upQ8(vw.q8.mergerMm0)
+          vb.set('mm0WQ', mm0Q8.packed)
+          vb.set('mm0WS', mm0Q8.scales)
+        } else {
+          vb.set('mm0Weight', up(vw.mergerMm0Weight))
+        }
+        if (vw.q8?.mergerMm2) {
+          const mm2Q8 = upQ8(vw.q8.mergerMm2)
+          vb.set('mm2WQ', mm2Q8.packed)
+          vb.set('mm2WS', mm2Q8.scales)
+        } else {
+          vb.set('mm2Weight', up(vw.mergerMm2Weight))
+        }
         vb.set('mm0Bias', up(vw.mergerMm0Bias))
-        vb.set('mm2Weight', up(vw.mergerMm2Weight))
         vb.set('mm2Bias', up(vw.mergerMm2Bias))
         for (let li = 0; li < vw.layers.length; li++) {
           const lw = vw.layers[li]
           const p = `l${li}.`
           vb.set(p + 'ln1W', up(lw.ln1Weight))
           vb.set(p + 'ln1B', up(lw.ln1Bias))
-          vb.set(p + 'qkvW', up(lw.qkvWeight))
+          // Q8_0 weights: upload packed Q8 only (skip f32 to save VRAM + upload time)
+          // ffn_down is F16 (not Q8_0), so always upload as f32
+          if (vw.q8) {
+            const ql = vw.q8.layers[li]
+            const qkvQ8 = upQ8(ql.qkv)
+            vb.set(p + 'qkvWQ', qkvQ8.packed)
+            vb.set(p + 'qkvWS', qkvQ8.scales)
+            const attnQ8 = upQ8(ql.attnOut)
+            vb.set(p + 'attnOutWQ', attnQ8.packed)
+            vb.set(p + 'attnOutWS', attnQ8.scales)
+            const ffnUpQ8 = upQ8(ql.ffnUp)
+            vb.set(p + 'ffnUpWQ', ffnUpQ8.packed)
+            vb.set(p + 'ffnUpWS', ffnUpQ8.scales)
+          } else {
+            // No Q8 — upload f32 weights
+            vb.set(p + 'qkvW', up(lw.qkvWeight))
+            vb.set(p + 'attnOutW', up(lw.attnOutWeight))
+            vb.set(p + 'ffnUpW', up(lw.ffnUpWeight))
+          }
           vb.set(p + 'qkvB', up(lw.qkvBias))
-          vb.set(p + 'attnOutW', up(lw.attnOutWeight))
           vb.set(p + 'attnOutB', up(lw.attnOutBias))
           vb.set(p + 'ln2W', up(lw.ln2Weight))
           vb.set(p + 'ln2B', up(lw.ln2Bias))
-          vb.set(p + 'ffnUpW', up(lw.ffnUpWeight))
           vb.set(p + 'ffnUpB', up(lw.ffnUpBias))
           vb.set(p + 'ffnDownW', up(lw.ffnDownWeight))
           vb.set(p + 'ffnDownB', up(lw.ffnDownBias))
+        }
+        // Upload merger Q8 weights
+        if (vw.q8) {
+          if (vw.q8.mergerMm0) {
+            const mm0Q8 = upQ8(vw.q8.mergerMm0)
+            vb.set('mm0WQ', mm0Q8.packed)
+            vb.set('mm0WS', mm0Q8.scales)
+          }
+          if (vw.q8.mergerMm2) {
+            const mm2Q8 = upQ8(vw.q8.mergerMm2)
+            vb.set('mm2WQ', mm2Q8.packed)
+            vb.set('mm2WS', mm2Q8.scales)
+          }
         }
       })
     }
@@ -3547,55 +3598,76 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       enc = device.createCommandEncoder()
       pass = enc.beginComputePass()
 
+      // Check if Q8 packed weights are available for in-shader dequantization
+      const hasQ8 = !!visionState.weights?.q8
+
       for (let li = 0; li < depth; li++) {
         const p = `l${li}.`
 
         // --- Attention block (4 dispatches) ---
-        // 1. LayerNorm1 (parallelized: 64 threads, tree reduction)
+        // 1. LayerNorm1
         runN(pass, 'vision_layernorm',
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h0, vw.get(p + 'ln1W')!, vw.get(p + 'ln1B')!], normedBuf, numPatches)
 
-        // 2. QKV projection with tiled matmul (shared memory for X)
-        setup(pass, 'vision_matmul_tiled',
-          [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
-          [normedBuf, vw.get(p + 'qkvW')!, vw.get(p + 'qkvB')!],
-          [qBuf, kBuf, vBuf])
+        // 2. QKV projection — Q8 in-shader dequant if available, else f32
+        if (hasQ8 && vw.get(p + 'qkvWQ')) {
+          setup(pass, 'vision_matmul_q8',
+            [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
+            [normedBuf, vw.get(p + 'qkvWQ')!, vw.get(p + 'qkvWS')!, vw.get(p + 'qkvB')!],
+            [qBuf, kBuf, vBuf])
+        } else {
+          setup(pass, 'vision_matmul_tiled',
+            [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
+            [normedBuf, vw.get(p + 'qkvW')!, vw.get(p + 'qkvB')!],
+            [qBuf, kBuf, vBuf])
+        }
         pass.dispatchWorkgroups(Math.ceil(3 * H / 64))
 
-        // 2b. Apply 2D RoPE to Q and K (one dispatch, all patches × heads)
+        // 2b. Apply 2D RoPE to Q and K
         setup(pass, 'vision_apply_rope',
           [['u', numPatches], ['u', heads], ['u', hd], ['u', hd / 2], ['u', 0], ['u', 0], ['u', 0], ['u', 0]],
           [qBuf, kBuf, qRopedBuf, kRopedBuf, cosBuf, sinBuf], [])
         pass.dispatchWorkgroups(numPatches)
 
         // 3. Bidirectional attention with pre-applied RoPE
-        //    Uses shared-memory tiling for K/V (TILE_SIZE=32, needs 32KB workgroup storage)
         setup(pass, 'vision_attention',
           [['u', heads], ['u', hd], ['u', numSegments], ['f', 1 / Math.sqrt(hd)], ['u', 0], ['u', 0], ['u', 0], ['u', 0]],
           [qRopedBuf, kRopedBuf, vBuf, cuBuf], [attnOut])
         pass.dispatchWorkgroups(numSegments, heads, Math.ceil(framePatches / 32))
 
-        // 4. Attn output proj + residual add (FUSED)
-        //    h1 = h0 + matmul(attnOut, attnOutW, attnOutB)
-        setup(pass, 'vision_matmul_tiled_add',
-          [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
-          [attnOut, vw.get(p + 'attnOutW')!, vw.get(p + 'attnOutB')!],
-          [h1, h0])  // out=h1, residual=h0
+        // 4. Attn output proj + residual add — Q8 if available, else f32
+        if (hasQ8 && vw.get(p + 'attnOutWQ')) {
+          setup(pass, 'vision_matmul_q8_add',
+            [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [attnOut, vw.get(p + 'attnOutWQ')!, vw.get(p + 'attnOutWS')!, vw.get(p + 'attnOutB')!],
+            [h1, h0])
+        } else {
+          setup(pass, 'vision_matmul_tiled_add',
+            [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [attnOut, vw.get(p + 'attnOutW')!, vw.get(p + 'attnOutB')!],
+            [h1, h0])
+        }
         pass.dispatchWorkgroups(Math.ceil(H / 64))
 
         // --- MLP block (3 dispatches) ---
-        // 5. LayerNorm2 (parallelized: 64 threads, tree reduction)
+        // 5. LayerNorm2
         runN(pass, 'vision_layernorm',
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h1, vw.get(p + 'ln2W')!, vw.get(p + 'ln2B')!], normed2Buf, numPatches)
 
-        // 6. FFN up + GELU (FUSED)
-        //    act = GELU(matmul(normed2, ffnUpW, ffnUpB))
-        setup(pass, 'vision_matmul_tiled_gelu',
-          [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
-          [normed2Buf, vw.get(p + 'ffnUpW')!, vw.get(p + 'ffnUpB')!],
-          [actBuf_])
+        // 6. FFN up + GELU — Q8 if available, else f32
+        if (hasQ8 && vw.get(p + 'ffnUpWQ')) {
+          setup(pass, 'vision_matmul_q8_gelu',
+            [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [normed2Buf, vw.get(p + 'ffnUpWQ')!, vw.get(p + 'ffnUpWS')!, vw.get(p + 'ffnUpB')!],
+            [actBuf_])
+        } else {
+          setup(pass, 'vision_matmul_tiled_gelu',
+            [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [normed2Buf, vw.get(p + 'ffnUpW')!, vw.get(p + 'ffnUpB')!],
+            [actBuf_])
+        }
         pass.dispatchWorkgroups(Math.ceil(inter / 64))
 
         // 7. FFN down + residual add (FUSED: 1 dispatch, was 2)
@@ -3632,21 +3704,34 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         [postLn], [shuffled])
       pass.dispatchWorkgroups(numMerged)
 
-      // 6. mm.0 + GELU (FUSED: 1 dispatch, was 2)
-      //    vision_matmul_tiled_gelu: act = GELU(matmul(shuffled, mm0W, mm0B))
+      // 6. mm.0 + GELU — Q8 if available, else f32
       const mm0Act = actBuf(numMerged * mergedDim)
-      setup(pass, 'vision_matmul_tiled_gelu',
-        [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
-        [shuffled, vw.get('mm0Weight')!, vw.get('mm0Bias')!],
-        [mm0Act])
+      if (hasQ8 && vw.get('mm0WQ')) {
+        setup(pass, 'vision_matmul_q8_gelu',
+          [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+          [shuffled, vw.get('mm0WQ')!, vw.get('mm0WS')!, vw.get('mm0Bias')!],
+          [mm0Act])
+      } else {
+        setup(pass, 'vision_matmul_tiled_gelu',
+          [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+          [shuffled, vw.get('mm0Weight')!, vw.get('mm0Bias')!],
+          [mm0Act])
+      }
       pass.dispatchWorkgroups(Math.ceil(mergedDim / 64))
 
-      // 7. mm.2: linear(4608→5120) + bias (tiled)
+      // 7. mm.2: linear(4608→5120) + bias — Q8 if available, else f32
       const imageEmbedsBuf = actBuf(numMerged * projDim)
-      setup(pass, 'vision_matmul_tiled',
-        [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
-        [mm0Act, vw.get('mm2Weight')!, vw.get('mm2Bias')!],
-        [imageEmbedsBuf, dummy1, dummy2])
+      if (hasQ8 && vw.get('mm2WQ')) {
+        setup(pass, 'vision_matmul_q8',
+          [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
+          [mm0Act, vw.get('mm2WQ')!, vw.get('mm2WS')!, vw.get('mm2Bias')!],
+          [imageEmbedsBuf, dummy1, dummy2])
+      } else {
+        setup(pass, 'vision_matmul_tiled',
+          [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
+          [mm0Act, vw.get('mm2Weight')!, vw.get('mm2Bias')!],
+          [imageEmbedsBuf, dummy1, dummy2])
+      }
       pass.dispatchWorkgroups(Math.ceil(projDim / 64))
 
       pass.end()
