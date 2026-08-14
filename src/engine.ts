@@ -536,7 +536,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // Vision tower pipelines (compiled only when the model has a vision config)
   if (visionState) {
     // All vision shaders use fixed @workgroup_size — no overrides needed
-    for (const n of ['vision_matmul', 'vision_layernorm', 'vision_gelu', 'vision_add',
+    for (const n of ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
+                      'vision_matmul_tiled_add', 'vision_layernorm', 'vision_gelu', 'vision_add',
                       'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
                       'vision_inject'])
       specs.push([n])
@@ -3394,6 +3395,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         }
         const vb = visionState!.buffers
         vb.set('patchEmbdWeight', up(vw.patchEmbdWeight))
+        vb.set('patchEmbdWeightCompact', up(vw.patchEmbdWeightCompact))
         vb.set('patchEmbdBias', up(vw.patchEmbdBias))
         vb.set('positionEmbd', up(vw.positionEmbd))
         vb.set('postLnWeight', up(vw.postLnWeight))
@@ -3445,9 +3447,10 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
     for (const image of images) {
       // CPU preprocessing (one-time per image)
-      const { patches, numPatches, gridThw } = preprocessImage(image, cfg)
+      const { patches, numPatches, gridThw, compact } = preprocessImage(image, cfg)
       const posEmbeds = computeVisionPosEmbed(gridThw, cfg, visionState.weights.positionEmbd)
       const [t, h, w] = gridThw
+      const patchInDim = compact ? (cfg.in_channels * cfg.patch_size * cfg.patch_size) : 1536
       const mergedH = h / mergeSize
       const mergedW = w / mergeSize
       const numMerged = t * mergedH * mergedW
@@ -3493,11 +3496,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       let enc = device.createCommandEncoder()
       let pass = enc.beginComputePass()
 
-      // 1. Patch embedding: linear(1536→1152) + bias
+      // 1. Patch embedding: linear(patchInDim→1152) + bias
+      // For still images: compact 768-dim patches with compact weight
+      // For video: full 1536-dim patches with full weight
       const patchOut = actBuf(numPatches * H)
+      const patchW = compact ? vw.get('patchEmbdWeightCompact')! : vw.get('patchEmbdWeight')!
       setup(pass, 'vision_patch_embed',
-        [['u', numPatches], ['u', 1536], ['u', H], ['u', 0]],
-        [patchBuf, vw.get('patchEmbdWeight')!, vw.get('patchEmbdBias')!],
+        [['u', numPatches], ['u', patchInDim], ['u', H], ['u', 0]],
+        [patchBuf, patchW, vw.get('patchEmbdBias')!],
         [patchOut])
       pass.dispatchWorkgroups(Math.ceil(H / 64), 1, 1)
 
@@ -3514,7 +3520,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       pass.end()
       device.queue.submit([enc.finish()])
 
-      // 3. 27 transformer blocks
+      // 3. 27 transformer blocks — all batched into ONE compute pass.
       // Pre-allocate scratch buffers ONCE and reuse across all layers.
       // Allocating per-layer would use ~228MB × 27 = 6.1GB for large images,
       // causing GPU OOM/thrashing. These buffers are scratch — written and
@@ -3525,97 +3531,79 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const kBuf = actBuf(numPatches * H)
       const vBuf = actBuf(numPatches * H)
       const attnOut = actBuf(numPatches * H)
-      const attnProj = actBuf(numPatches * H)
-      const upBuf = actBuf(numPatches * inter)
-      const actBuf_ = actBuf(numPatches * inter)
-      const downBuf = actBuf(numPatches * H)
+      // Fused shaders eliminate: attnProj, upBuf, downBuf (3 fewer buffers)
+      const actBuf_ = actBuf(numPatches * inter)  // FFN up+GELU output
+
+      // Buffer swapping:
+      //   Step 4 (attn proj+residual): reads h0 (residual), writes h1
+      //   Step 7 (FFN down+residual): reads h1 (residual), writes h0
+      // After each layer: h0 = current hidden, h1 = scratch. Clean ping-pong.
+
+      // Start ONE compute pass for all 27 layers (eliminates 26 submit overheads)
+      enc = device.createCommandEncoder()
+      pass = enc.beginComputePass()
+
       for (let li = 0; li < depth; li++) {
-        // Start a new command buffer for this layer (watchdog safety)
-        enc = device.createCommandEncoder()
-        pass = enc.beginComputePass()
         const p = `l${li}.`
-        // --- Attention block ---
-        // LayerNorm1
+
+        // --- Attention block (3 dispatches, down from 5) ---
+        // 1. LayerNorm1
         runN(pass, 'vision_layernorm',
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h0, vw.get(p + 'ln1W')!, vw.get(p + 'ln1B')!], normedBuf, numPatches)
 
-        // QKV projection with split outputs: [numPatches, 1152] → Q,K,V each [numPatches, 1152]
-        // vision_matmul routes by N0/N1/N2: N0=H (Q), N1=H (K), N2=H (V)
-        setup(pass, 'vision_matmul',
+        // 2. QKV projection with tiled matmul (shared memory for X)
+        setup(pass, 'vision_matmul_tiled',
           [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
           [normedBuf, vw.get(p + 'qkvW')!, vw.get(p + 'qkvB')!],
           [qBuf, kBuf, vBuf])
         pass.dispatchWorkgroups(Math.ceil(3 * H / 64))
 
-        // Bidirectional attention with 2D RoPE: one workgroup per (segment, head, query_block)
-        // @workgroup_size(32) — each thread handles one query, 32 queries per workgroup
+        // 3. Bidirectional attention with 2D RoPE
         setup(pass, 'vision_attention',
           [['u', heads], ['u', hd], ['u', numSegments], ['f', 1 / Math.sqrt(hd)], ['u', hd / 2], ['u', 0], ['u', 0]],
           [qBuf, kBuf, vBuf, cuBuf, cosBuf, sinBuf], [attnOut])
         pass.dispatchWorkgroups(numSegments, heads, Math.ceil(framePatches / 32))
 
-        // Output projection: [numPatches, H] → [numPatches, H]
-        // Single-output matmul: N0=H, N1=0, N2=0 → everything to out0
-        setup(pass, 'vision_matmul',
-          [['u', numPatches], ['u', H], ['u', H], ['u', H], ['u', 0], ['u', 0], ['u', 1]],
+        // 4. Attn output proj + residual add (FUSED: 1 dispatch, was 2)
+        //    h1 = h0 + matmul(attnOut, attnOutW, attnOutB)
+        //    vision_matmul_tiled_add bindings: [x, w, bias] = ins, [out, residual] = outs
+        setup(pass, 'vision_matmul_tiled_add',
+          [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
           [attnOut, vw.get(p + 'attnOutW')!, vw.get(p + 'attnOutB')!],
-          [attnProj, dummy1, dummy2])  // out1/out2 unused → dummies (no aliasing)
+          [h1, h0])  // out=h1, residual=h0
         pass.dispatchWorkgroups(Math.ceil(H / 64))
 
-        // Residual add: h1 = h0 + attnProj
-        setup(pass, 'vision_add',
-          [['u', numPatches * H], ['u', 0], ['u', 0], ['u', 0]],
-          [h0, attnProj], [h1])
-        {
-          const [gx, gy] = grid2d(Math.ceil((numPatches * H) / 64))
-          pass.dispatchWorkgroups(gx, gy, 1)
-        }
-        ;[h0, h1] = [h1, h0]  // swap
-
-        // --- MLP block ---
-        // LayerNorm2
+        // --- MLP block (3 dispatches, down from 5) ---
+        // 5. LayerNorm2 — input is h1 (post-attention residual)
         runN(pass, 'vision_layernorm',
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
-          [h0, vw.get(p + 'ln2W')!, vw.get(p + 'ln2B')!], normed2Buf, numPatches)
+          [h1, vw.get(p + 'ln2W')!, vw.get(p + 'ln2B')!], normed2Buf, numPatches)
 
-        // FFN up: [numPatches, H] → [numPatches, inter]
-        setup(pass, 'vision_matmul',
-          [['u', numPatches], ['u', inter], ['u', H], ['u', inter], ['u', 0], ['u', 0], ['u', 1]],
+        // 6. FFN up + GELU (FUSED: 1 dispatch, was 2)
+        //    act = GELU(matmul(normed2, ffnUpW, ffnUpB))
+        setup(pass, 'vision_matmul_tiled_gelu',
+          [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
           [normed2Buf, vw.get(p + 'ffnUpW')!, vw.get(p + 'ffnUpB')!],
-          [upBuf, dummy1, dummy2])
+          [actBuf_])
         pass.dispatchWorkgroups(Math.ceil(inter / 64))
 
-        // GELU
-        runIO(pass, 'vision_gelu',
-          [['u', numPatches * inter], ['u', 0], ['u', 0], ['u', 0]],
-          [upBuf], [actBuf_], numPatches * inter)
-
-        // FFN down: [numPatches, inter] → [numPatches, H]
-        setup(pass, 'vision_matmul',
-          [['u', numPatches], ['u', H], ['u', inter], ['u', H], ['u', 0], ['u', 0], ['u', 1]],
+        // 7. FFN down + residual add (FUSED: 1 dispatch, was 2)
+        //    h0 = h1 + matmul(act, ffnDownW, ffnDownB)
+        setup(pass, 'vision_matmul_tiled_add',
+          [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
           [actBuf_, vw.get(p + 'ffnDownW')!, vw.get(p + 'ffnDownB')!],
-          [downBuf, dummy1, dummy2])
+          [h0, h1])  // out=h0, residual=h1
         pass.dispatchWorkgroups(Math.ceil(H / 64))
 
-        // Residual add: h1 = h0 + down
-        setup(pass, 'vision_add',
-          [['u', numPatches * H], ['u', 0], ['u', 0], ['u', 0]],
-          [h0, downBuf], [h1])
-        {
-          const [gx, gy] = grid2d(Math.ceil((numPatches * H) / 64))
-          pass.dispatchWorkgroups(gx, gy, 1)
-        }
-
-        ;[h0, h1] = [h1, h0]  // swap
-
-        // Submit this layer's command buffer (watchdog safety: each layer < 5s GPU time)
-        pass.end()
-        device.queue.submit([enc.finish()])
-        // Drain the GPU queue every 3 layers to prevent command buffer buildup
-        // (rapid-fire submits without waiting can exhaust driver command buffer slots)
-        if (li % 3 === 2) await device.queue.onSubmittedWorkDone()
+        // After this layer: h0 = current hidden states, h1 = scratch
       }
+
+      // End the compute pass and submit ALL 27 layers as one command buffer
+      pass.end()
+      device.queue.submit([enc.finish()])
+      // Drain once after all layers
+      await device.queue.onSubmittedWorkDone()
 
       // Start a new command buffer for the merger
       enc = device.createCommandEncoder()
@@ -3634,23 +3622,18 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         [postLn], [shuffled])
       pass.dispatchWorkgroups(numMerged)
 
-      // 6. mm.0: linear(4608→4608) + bias
-      const mm0Out = actBuf(numMerged * mergedDim)
-      setup(pass, 'vision_matmul',
-        [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', mergedDim], ['u', 0], ['u', 0], ['u', 1]],
+      // 6. mm.0 + GELU (FUSED: 1 dispatch, was 2)
+      //    vision_matmul_tiled_gelu: act = GELU(matmul(shuffled, mm0W, mm0B))
+      const mm0Act = actBuf(numMerged * mergedDim)
+      setup(pass, 'vision_matmul_tiled_gelu',
+        [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
         [shuffled, vw.get('mm0Weight')!, vw.get('mm0Bias')!],
-        [mm0Out, dummy1, dummy2])
+        [mm0Act])
       pass.dispatchWorkgroups(Math.ceil(mergedDim / 64))
 
-      // 7. GELU
-      const mm0Act = actBuf(numMerged * mergedDim)
-      runIO(pass, 'vision_gelu',
-        [['u', numMerged * mergedDim], ['u', 0], ['u', 0], ['u', 0]],
-        [mm0Out], [mm0Act], numMerged * mergedDim)
-
-      // 8. mm.2: linear(4608→5120) + bias
+      // 7. mm.2: linear(4608→5120) + bias (tiled)
       const imageEmbedsBuf = actBuf(numMerged * projDim)
-      setup(pass, 'vision_matmul',
+      setup(pass, 'vision_matmul_tiled',
         [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
         [mm0Act, vw.get('mm2Weight')!, vw.get('mm2Bias')!],
         [imageEmbedsBuf, dummy1, dummy2])
@@ -3667,12 +3650,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       // Cleanup per-image buffers (after submit + readback, so GPU is done with them)
       normedBuf.destroy(); normed2Buf.destroy()
       qBuf.destroy(); kBuf.destroy(); vBuf.destroy()
-      attnOut.destroy(); attnProj.destroy()
-      upBuf.destroy(); actBuf_.destroy(); downBuf.destroy()
+      attnOut.destroy()
+      actBuf_.destroy()
       patchBuf.destroy(); posBuf.destroy(); h0.destroy(); h1.destroy(); cuBuf.destroy()
       cosBuf.destroy(); sinBuf.destroy()
       patchOut.destroy(); postLn.destroy(); shuffled.destroy()
-      mm0Out.destroy(); mm0Act.destroy(); imageEmbedsBuf.destroy(); dummy1.destroy(); dummy2.destroy()
+      mm0Act.destroy(); imageEmbedsBuf.destroy(); dummy1.destroy(); dummy2.destroy()
     }
 
     // Concatenate all image embeddings

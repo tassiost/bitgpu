@@ -282,6 +282,10 @@ export interface VisionWeights {
   // Patch embedding: two [16,16,3,1152] tensors concatenated → [1536, 1152]
   patchEmbdWeight: Float32Array  // [1536, 1152] (concatenated, transposed for matmul)
   patchEmbdBias: Float32Array   // [1152]
+  // Compact patch embedding for still images: sum of temporal frames → [768, 1152]
+  // For still images (frames=1), the two temporal frames are identical, so
+  // W_compact = W_frame0 + W_frame1 gives the same result with half the input.
+  patchEmbdWeightCompact: Float32Array  // [768, 1152]
   // Position embeddings: [2304, 1152] (1152-dim per position, 2304 positions)
   positionEmbd: Float32Array    // [2304, 1152]
   // Post layernorm
@@ -375,10 +379,15 @@ export async function loadVisionWeights(
   // Flat layout: data[o * 768 + i] where o=out=1152, i=flattened(w,h,c)=768
   // This is already [out, in] row-major — no transposition needed.
   // patchW0 is frame 0, patchW1 is frame 1
+  // Also compute compact weight: W_compact = W_frame0 + W_frame1 (for still images)
+  const patchEmbdWeightCompact = new Float32Array(768 * 1152)
   for (let o = 0; o < 1152; o++) {
     for (let i = 0; i < 768; i++) {
-      patchEmbdWeight[o * 1536 + i] = patchW0.data[o * 768 + i]       // frame 0
-      patchEmbdWeight[o * 1536 + 768 + i] = patchW1.data[o * 768 + i] // frame 1
+      const w0 = patchW0.data[o * 768 + i]
+      const w1 = patchW1.data[o * 768 + i]
+      patchEmbdWeight[o * 1536 + i] = w0       // frame 0
+      patchEmbdWeight[o * 1536 + 768 + i] = w1 // frame 1
+      patchEmbdWeightCompact[o * 768 + i] = w0 + w1  // compact: sum of temporal frames
     }
   }
 
@@ -443,6 +452,7 @@ export async function loadVisionWeights(
   const weights: VisionWeights = {
     patchEmbdWeight,  // [1536, 1152] = [in, out] — wait, we built it as [out, in]
     patchEmbdBias: patchBias.data,
+    patchEmbdWeightCompact,  // [768, 1152] — sum of temporal frames for still images
     positionEmbd,
     postLnWeight: postLn.data,
     postLnBias: postLnB.data,
@@ -605,7 +615,7 @@ export function preprocessImage(
   image: ImageInput,
   config: VisionConfig,
   maxPixels?: number,
-): { patches: Float32Array; numPatches: number; gridThw: [number, number, number] } {
+): { patches: Float32Array; numPatches: number; gridThw: [number, number, number]; compact: boolean } {
   let { width, height, rgb, frames = 1 } = image
   const { patch_size, temporal_patch_size, spatial_merge_size, in_channels } = config
 
@@ -631,8 +641,15 @@ export function preprocessImage(
   const numWidthPatches = width / patch_size
   const numPatches = numTemporal * numHeightPatches * numWidthPatches
 
-  // Each patch: in_channels * temporal_patch_size * patch_size * patch_size = 1536
-  const patchDim = in_channels * temporal_patch_size * patch_size * patch_size
+  // Compact patch embedding for still images: skip temporal duplication.
+  // For still images (frames=1), the two temporal frames are identical, so
+  // we can use 768-dim patches (no temporal) with the compact weight
+  // (W_frame0 + W_frame1) instead of 1536-dim patches with the full weight.
+  const isStillImage = frames === 1
+  const compact = isStillImage
+  const patchDim = compact
+    ? in_channels * patch_size * patch_size                    // 768
+    : in_channels * temporal_patch_size * patch_size * patch_size  // 1536
 
   // CRITICAL: Patches are arranged in [t, h_blk, w_blk, h_intra, w_intra] order
   // (not standard [t, h, w] order). This matches the reference image processor
@@ -660,7 +677,8 @@ export function preprocessImage(
 
             let dimIdx = 0
             for (let c = 0; c < in_channels; c++) {
-              for (let tt = 0; tt < temporal_patch_size; tt++) {
+              const ttMax = compact ? 1 : temporal_patch_size
+              for (let tt = 0; tt < ttMax; tt++) {
                 for (let ph = 0; ph < patch_size; ph++) {
                   for (let pw = 0; pw < patch_size; pw++) {
                     const frame = t * temporal_patch_size + tt
@@ -682,7 +700,7 @@ export function preprocessImage(
   }
 
   const gridThw: [number, number, number] = [numTemporal, numHeightPatches, numWidthPatches]
-  return { patches, numPatches, gridThw }
+  return { patches, numPatches, gridThw, compact }
 }
 
 /**
@@ -1083,13 +1101,17 @@ export function visionForwardCpu(
 
   for (const image of images) {
     // 1. Preprocess → patches
-    const { patches, numPatches, gridThw } = preprocessImage(image, config)
+    const { patches, numPatches, gridThw, compact } = preprocessImage(image, config)
 
-    // 2. Patch embedding: linear(1536→1152) + bias
-    // patches: [numPatches, 1536], weight: [1152, 1536], bias: [1152]
-    // → [numPatches, 1152]
-    let hidden_states = matmul(patches, weights.patchEmbdWeight, weights.patchEmbdBias,
-      numPatches, hidden_size, in_channels * temporal_patch_size * patch_size * patch_size)
+    // 2. Patch embedding: linear(in_dim→1152) + bias
+    // For still images: compact 768-dim patches with compact weight (sum of temporal frames)
+    // For video: full 1536-dim patches with full weight
+    const patchWeight = compact ? weights.patchEmbdWeightCompact : weights.patchEmbdWeight
+    const patchInDim = compact
+      ? in_channels * patch_size * patch_size                    // 768
+      : in_channels * temporal_patch_size * patch_size * patch_size  // 1536
+    let hidden_states = matmul(patches, patchWeight, weights.patchEmbdBias,
+      numPatches, hidden_size, patchInDim)
 
     // 3. Add position embeddings
     const posEmbeds = computeVisionPosEmbed(gridThw, config, weights.positionEmbd)

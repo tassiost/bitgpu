@@ -1,10 +1,11 @@
 // Vision LayerNorm — the vision tower uses LayerNorm (with weight + bias), NOT RMSNorm.
 // LayerNorm: y = (x - mean) / sqrt(var + eps) * gamma + beta
-// eps = 1e-6 (from clip.vision.attention.layer_norm_epsilon)
+// eps = 1e-6 (from clip.vision.layer_norm_epsilon)
 //
-// One thread per row (no subgroups — avoids SG/actual-subgroup-size mismatch).
-// Uses numerically stable two-pass variance: var = sum((x-mean)^2) / D
-// (NOT sum_sq/D - mean^2, which suffers catastrophic cancellation when variance ≈ 0).
+// Uses @workgroup_size(64) with a single-thread two-pass reduction.
+// One workgroup per row — 64 threads are available but only thread 0 does the
+// reduction (the workgroup size is set to 64 for GPU occupancy efficiency;
+// the extra threads are idle but the scheduler handles this better than wg=1).
 struct Params {
   R: u32,    // number of rows (seq_len)
   D: u32,    // hidden_size (1152)
@@ -18,7 +19,7 @@ struct Params {
 @group(0) @binding(3) var<storage, read> beta: array<f32>;   // ln bias
 @group(0) @binding(4) var<storage, read_write> y: array<f32>;
 
-@compute @workgroup_size(1)
+@compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>) {
   let row = wg.x;
   if (row >= p.R) { return; }
