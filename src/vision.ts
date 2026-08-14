@@ -555,10 +555,12 @@ function bicubicResize(
   const xScale = srcW / dstW
   const yScale = srcH / dstH
 
-  // Catmull-Rom cubic kernel with a=-0.75 (PIL's default)
+  // Catmull-Rom cubic kernel with a=-0.5 (matches PIL BICUBIC / antialias)
+  // PIL uses a=-0.5 for its bicubic filter, NOT a=-0.75 (Catmull-Rom).
+  // This difference is critical for text recognition accuracy in VLMs.
   // Uses |t| — the kernel is symmetric (even function)
   const cubicKernel = (t: number): number => {
-    const a = -0.75
+    const a = -0.5
     const at = Math.abs(t)
     const t2 = at * at
     const t3 = t2 * at

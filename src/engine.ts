@@ -539,7 +539,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     for (const n of ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
                       'vision_matmul_tiled_add', 'vision_layernorm', 'vision_gelu', 'vision_add',
                       'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
-                      'vision_inject'])
+                      'vision_apply_rope', 'vision_inject'])
       specs.push([n])
   }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
@@ -3530,6 +3530,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const qBuf = actBuf(numPatches * H)
       const kBuf = actBuf(numPatches * H)
       const vBuf = actBuf(numPatches * H)
+      const qRopedBuf = actBuf(numPatches * H)
+      const kRopedBuf = actBuf(numPatches * H)
       const attnOut = actBuf(numPatches * H)
       // Fused shaders eliminate: attnProj, upBuf, downBuf (3 fewer buffers)
       const actBuf_ = actBuf(numPatches * inter)  // FFN up+GELU output
@@ -3559,10 +3561,20 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           [qBuf, kBuf, vBuf])
         pass.dispatchWorkgroups(Math.ceil(3 * H / 64))
 
-        // 3. Bidirectional attention with 2D RoPE
+        // 2b. Apply 2D RoPE to Q and K (one dispatch, all patches × heads)
+        // This pre-rotates Q/K so the attention kernel doesn't need to re-apply
+        // RoPE for every query×key pair (eliminates O(N²) redundant RoPE work)
+        setup(pass, 'vision_apply_rope',
+          [['u', numPatches], ['u', heads], ['u', hd], ['u', hd / 2], ['u', 0], ['u', 0], ['u', 0], ['u', 0]],
+          [qBuf, kBuf, qRopedBuf, kRopedBuf, cosBuf, sinBuf], [])
+        pass.dispatchWorkgroups(numPatches)
+
+        // 3. Bidirectional attention with pre-applied RoPE
+        // Q and K already have RoPE applied — attention is pure Q·K^T·V
+        // Uses shared-memory tiling for K/V (cooperative load, 32 threads)
         setup(pass, 'vision_attention',
-          [['u', heads], ['u', hd], ['u', numSegments], ['f', 1 / Math.sqrt(hd)], ['u', hd / 2], ['u', 0], ['u', 0]],
-          [qBuf, kBuf, vBuf, cuBuf, cosBuf, sinBuf], [attnOut])
+          [['u', heads], ['u', hd], ['u', numSegments], ['f', 1 / Math.sqrt(hd)], ['u', 0], ['u', 0], ['u', 0], ['u', 0]],
+          [qRopedBuf, kRopedBuf, vBuf, cuBuf], [attnOut])
         pass.dispatchWorkgroups(numSegments, heads, Math.ceil(framePatches / 32))
 
         // 4. Attn output proj + residual add (FUSED: 1 dispatch, was 2)
@@ -3650,6 +3662,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       // Cleanup per-image buffers (after submit + readback, so GPU is done with them)
       normedBuf.destroy(); normed2Buf.destroy()
       qBuf.destroy(); kBuf.destroy(); vBuf.destroy()
+      qRopedBuf.destroy(); kRopedBuf.destroy()
       attnOut.destroy()
       actBuf_.destroy()
       patchBuf.destroy(); posBuf.destroy(); h0.destroy(); h1.destroy(); cuBuf.destroy()
