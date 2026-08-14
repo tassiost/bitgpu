@@ -168,7 +168,22 @@ Pattern follows the LLM engine's `matmul_split_tiled.wgsl`:
 **Results**: Vision tower 31.1s → 26.9s (13% faster). Accuracy preserved.
 Combined with Q8+F16: 33.9s → 26.9s (20.6% total improvement).
 
-### 7. Previous optimizations (commit e177133)
+### 7. 2D tiled F16 matmul for FFN down (P5 — BIGGEST WIN)
+
+**Problem**: The ffn_down matmul (the largest weight: 9.9 MB f16/layer) still
+used the 1D tiled pattern that read W from global memory for every M iteration
+(234× redundant for 234 patches).
+
+**Fix**: 2D tiled register-blocked f16 matmul. Combines 2D tiling (BM=64,
+BN=64, BK=16) with f16 weight storage. F16 weights are widened to f32 during
+the cooperative W tile load into shared memory.
+
+**Files**: `shaders/vision_matmul_f16_tiled_add.wgsl` (new), `src/engine.ts` (2D dispatch)
+
+**Results**: Vision tower 26.9s → 12.2s (55% faster). Accuracy preserved.
+Combined Q8+F16+2D tiling: 33.9s → 12.2s (64% total improvement).
+
+### 8. Previous optimizations (commit e177133)
 
 Already implemented before this session:
 1. Compact patch embedding for still images (sum temporal weights → 768-dim)
@@ -241,12 +256,7 @@ with f16 on WebGPU).
 **Note**: Weight bandwidth (22.1 MB/layer with Q8+F16) now closer to
 activation bandwidth (~9.4 MB/layer), so P4b is more impactful than before.
 
-### P5: 2D tiled matmul for ffn_down (F16)
-
-The ffn_down matmul still uses the 1D tiled pattern (vision_matmul_f16_add).
-Applying 2D tiling (like the Q8 shaders) would eliminate redundant W reads
-across M iterations. The f16 weight would be loaded into shared memory as
-f16 and widened to f32 during the dot product.
+### P5: 2D tiled matmul for ffn_down (F16) — DONE (see Completed Optimizations #7)
 
 ### P6: 2D tiled matmul — DONE (see Completed Optimizations #6)
 
@@ -375,3 +385,13 @@ barrier overhead can exceed the saved memory traffic.
 - Combined with Q8+F16: 33.9s → 26.9s (20.6% total improvement)
 - Pattern: Follows LLM engine's matmul_split_tiled.wgsl —
   BM=64, BN=64, BK=16, 256 threads, 4×4 register tiles, 8KB shared memory
+
+### 2025-01-XX: 2D tiled F16 matmul for ffn_down
+- Status: COMPLETE
+- Files changed:
+  - `shaders/vision_matmul_f16_tiled_add.wgsl` (new — 2D tiled f16 + residual add)
+  - `src/engine.ts` (use vision_matmul_f16_tiled_add with 2D dispatch)
+- Results: Vision tower 26.9s → 12.2s (55% faster). Accuracy preserved.
+- Combined Q8+F16+2D tiling: 33.9s → 12.2s (64% total improvement)
+- Pattern: Combines 2D tiling (matmul_split_tiled) with f16 storage
+  (attention_sg_kv16) — f16 weights widened to f32 during cooperative W tile load
