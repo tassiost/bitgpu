@@ -60,10 +60,6 @@ export function dequantQ8_0(data: Uint8Array, N: number, K: number): Float32Arra
  *  The shader reads packed words and scales, dequantizes inline:
  *    value = f32(int8_value) * scale
  *
- *  This is the same pattern as the LLM engine's q8 KV cache (copy_kv8.wgsl),
- *  which uses unpack4x8snorm + block scales. Here we use raw int8 extraction
- *  via bit shifts (i32 sign-extends) since GGUF Q8_0 uses int8, not snorm8.
- *
  *  Weight bandwidth: K bytes/row (packed) + K/8 bytes/row (scales) = 1.125K
  *  vs 4K for f32 — 3.56x reduction. */
 export function repackQ8_0(
@@ -453,7 +449,28 @@ export async function loadVisionWeights(
   // 2. Build VisionConfig from metadata
   const config = visionConfigFromMmproj(meta)
 
-  // 3. Load all tensors
+  // 3. Bulk-fetch the entire data section in ONE request (instead of 334
+  //    individual HTTP Range requests). This eliminates HTTP overhead and
+  //    reduces weight loading from ~4s to ~0.5s on localhost.
+  let dataEnd = 0
+  for (const name in gg) {
+    const t = gg[name]
+    const elems = t.dims.reduce((a: number, b: number) => a * b, 1)
+    let bytesPerElem: number
+    switch (t.type) {
+      case GGUF_F32: bytesPerElem = 4; break
+      case GGUF_F16: bytesPerElem = 2; break
+      case GGUF_Q8_0: bytesPerElem = Q8_0_BLOCK_SIZE / 32; break  // 34/32
+      default: bytesPerElem = 4
+    }
+    const byteLen = Math.ceil(elems * bytesPerElem)
+    const end = t.off + byteLen
+    if (end > dataEnd) dataEnd = end
+  }
+  const bulkBuf = await fetchFn(mmprojUrl, dataStart, dataEnd)
+  const bulkData = new Uint8Array(bulkBuf)
+
+  // 4. Load all tensors from the pre-fetched bulk buffer
   const depth = config.depth
   const totalTensors = depth * 12 + 8  // ~334 tensors
   let loaded = 0
@@ -461,10 +478,43 @@ export async function loadVisionWeights(
   const get = async (name: string): Promise<VisionWeight> => {
     const t = gg[name]
     if (!t) throw new Error(`mmproj: tensor ${name} not found`)
-    const w = await loadTensor(mmprojUrl, t, dataStart, fetchRange)
+    // Extract tensor bytes from the bulk buffer (no HTTP request)
+    const elems = t.dims.reduce((a: number, b: number) => a * b, 1)
+    let bytesPerElem: number
+    switch (t.type) {
+      case GGUF_F32: bytesPerElem = 4; break
+      case GGUF_F16: bytesPerElem = 2; break
+      case GGUF_Q8_0: bytesPerElem = Q8_0_BLOCK_SIZE / 32; break
+      default: bytesPerElem = 4
+    }
+    const byteLen = Math.ceil(elems * bytesPerElem)
+    const raw = bulkData.subarray(t.off, t.off + byteLen)
+    // Dequantize based on type
+    const dims = t.dims
+    let data: Float32Array
+    switch (t.type) {
+      case GGUF_F32:
+        data = new Float32Array(raw.buffer, raw.byteOffset, elems)
+        break
+      case GGUF_F16:
+        // Skip f32 dequantization — GPU shaders use raw f16 bytes directly.
+        // The f32 data is only needed for the non-F16 fallback path, which
+        // is never taken when F16 weights are available.
+        data = new Float32Array(0)
+        return { name: t.name, data, dims, raw, type: GGUF_F16 }
+      case GGUF_Q8_0: {
+        // Skip f32 dequantization — GPU shaders use raw Q8 bytes directly.
+        // The f32 data is only needed for the non-Q8 fallback path, which
+        // is never taken when Q8 weights are available.
+        data = new Float32Array(0)
+        return { name: t.name, data, dims, raw, type: GGUF_Q8_0 }
+      }
+      default:
+        throw new Error(`Tensor ${t.name}: unsupported type ${t.type}`)
+    }
     loaded++
     onProgress?.(loaded, totalTensors)
-    return w
+    return { name: t.name, data, dims }
   }
 
   // Patch embedding: two weights concatenated

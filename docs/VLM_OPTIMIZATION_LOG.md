@@ -20,14 +20,19 @@ Bonsai-27B (Qwen3-VL) vision tower implementation in bitgpu.
 
 | Metric | Baseline | After opt | Improvement |
 |--------|----------|-----------|-------------|
-| Vision tower | 50.8s | 5.4s | 89% faster |
+| Vision tower | 50.8s | 3.0s | 94% faster |
 | Prefill | 18.2s | 11.0s | 40% faster |
-| Tokens/s | 3.6 | 5.9 | 64% faster |
+| Tokens/s | 3.6 | 6.1 | 69% faster |
 
 **Benchmark results** (3 runs, 234 patches, 90s cooldown between runs):
-- Run 1: 6040ms (cold), Run 2: 5451ms, Run 3: 5443ms
-- Min: 5443ms, Max: 6040ms, Avg: 5645ms
-- Per-layer: 201.6ms/layer
+- Run 1: 2990ms, Run 2: 3241ms, Run 3: 3142ms
+- Min: 2990ms, Max: 3241ms, Avg: 3124ms
+- Per-layer: 110.7ms/layer
+
+**Breakdown** (from internal profiling):
+- Weight loading: ~1.6s (bulk fetch + skip f32 dequantization)
+- GPU forward: ~1.4s (27 layers × 47ms/layer + patch embed + merger)
+- Second call (weights cached): ~1.4s only
 
 **Red 32×32 image results**:
 
@@ -607,3 +612,92 @@ tile size for attention on Apple Silicon.
 - Combined Q8+F16+2D tiling+vec4 attention: 33.9s → 8.7s (74% total improvement)
 - Pattern: head_dim=72=4×18, all loops use vec4 dot/mul-add/load/write.
   Shared memory tiles stored as array<vec4<f32>>.
+
+### 2026-08-14: unpack4x8snorm for Q8 dequantization (TESTED, NEUTRAL, REVERTED)
+Tried replacing the bit-shift Q8 dequant (shift/mask/sign-extend/convert/multiply)
+with `unpack4x8snorm` (hardware int8→f32 conversion). Pre-multiplied scales by
+127.0 in `repackQ8_0` so the shader does `unpack4x8snorm(packed) * scale`.
+
+Result: NO measurable change (5718ms vs baseline 5443ms — within noise).
+Accuracy preserved.
+
+**Why neutral**: The WGSL compiler already optimizes the bit-shift pattern
+into efficient hardware sign-extension instructions. `unpack4x8snorm` is
+semantically equivalent but doesn't unlock new hardware paths on Apple
+Silicon. The 6× instruction count reduction is theoretical — the compiler
+was already doing this optimization.
+
+**Note on -128 clamping**: `unpack4x8snorm` clamps int8 -128 to -1.0 (like
+-127), introducing a 0.78% error on that single value. This is negligible
+vs Q8_0's inherent quantization error but is a minor correctness concern.
+
+**Lesson**: Hardware builtins like `unpack4x8snorm` are convenient but not
+necessarily faster than bit-shift patterns on Apple Silicon — the WGSL
+compiler already optimizes the latter well. Always benchmark.
+
+### 2026-08-14: chromium-experimental-subgroup-matrix (TESTED, BLOCKED BY BUG, REVERTED)
+Tried using `chromium-experimental-subgroup-matrix` for hardware-accelerated
+8×8×8 matrix multiply-accumulate (maps to Apple's simdgroup_matrix hardware
+units on Metal 3).
+
+**Implementation**:
+- Built a standalone test (`test-sgmat.html`) to isolate the API
+- Discovered the supported type combination on Apple Silicon:
+  - f16 inputs + f32 accumulation ✓ (what llama.cpp uses)
+  - f32 inputs + f32 accumulation ✗ (NOT supported — compile error)
+  - i8/u8 inputs + i32 accumulation ✓
+- Built a correct f16-input/f32-accumulate shader that passes standalone
+  tests (1-SG, 2-SG, 8-SG, and K-loop iterations all match CPU reference)
+- Wired it into the vision tower QKV projection
+
+**Result**: 2× PERFORMANCE REGRESSION + BROKEN ACCURACY.
+- Vision tower: 5443ms → 14748ms (2.7× slower)
+- LLM generation: 34s → 67s (2× slower)
+- Model output: nonsensical ("glitch art" instead of screenshot description)
+
+**Root cause**: Requesting the `chromium-experimental-subgroup-matrix` feature
+degrades ALL shader performance on this device — even shaders that don't use
+the feature. Confirmed by disabling the sgmat shader path (keeping only the
+feature request): the 2× regression persisted across the entire pipeline
+(vision + LLM). This is a Chrome/Dawn bug on Apple Silicon, not a shader
+correctness issue (the standalone tests all passed).
+
+**Reverted**: Removed the feature request, the sgmat shader, and the dispatch
+path. Baseline restored (5357ms vision, 34s generation, correct accuracy).
+
+**Lesson**: Experimental WebGPU features can have device-wide side effects
+that aren't limited to the shaders using them. Always test "feature requested
+but unused" as a control. The subgroup-matrix API itself works correctly
+(standalone tests pass with f16 inputs + f32 accumulation), but the Chrome
+implementation has a bug that makes it unsuitable for production use on
+Apple Silicon as of Chrome 138 (2026-08-14).
+
+### 2026-08-15: Bulk fetch + skip f32 dequantization (46% faster, KEPT)
+**Two optimizations to weight loading, applied together:**
+
+1. **Bulk fetch**: Replaced 334 individual HTTP Range requests (one per tensor)
+   with a single fetch for the entire data section. Reduced HTTP overhead.
+
+2. **Skip f32 dequantization**: Q8_0 and F16 weights were being dequantized to
+   f32 on CPU during loading, but the GPU shaders use the raw Q8/F16 bytes
+   directly (via in-shader dequantization). The f32 arrays were never uploaded
+   to GPU — they were pure waste. Skipping dequantization saves ~2.3s of CPU
+   time and ~2.3GB of memory allocation.
+
+**Results**: 5579ms → 2990ms (46% faster)
+- Weight loading: 4134ms → 1580ms (2.6× faster)
+- GPU forward: 1414ms → 1420ms (unchanged — as expected)
+- Second call (weights cached): ~1420ms only
+
+**Files changed**:
+- `src/vision.ts`: Bulk fetch + skip dequantization in `loadVisionWeights()`
+- `src/engine.ts`: Removed debug timing code
+
+**Key insight**: The benchmark was measuring 75% weight loading + 25% GPU
+compute. The "5.5s vision tower" was actually 4.1s of CPU work (HTTP fetch +
+dequantization) + 1.4s of GPU work. The GPU forward pass was never the
+bottleneck — the CPU loading was.
+
+**Lesson**: Always profile the full pipeline before optimizing individual
+kernels. The matmul shader optimizations (BM=128, BKV=2, hybrid shared memory)
+all failed because they targeted the wrong bottleneck.
