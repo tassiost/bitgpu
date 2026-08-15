@@ -975,3 +975,22 @@ the same code). This is due to:
 
 **Recommendation**: For stable measurements, use GPU timestamp queries or run
 the vision tower in isolation (without LLM generation before/after).
+
+### Vision weight preloading (2025-01-24)
+
+Moved vision weight loading (HTTP fetch + CPU repacking + GPU upload) from
+the first `visionForward` call to engine init time, overlapping it with
+LLM model loading and pipeline compilation.
+
+**Before**: First `visionForward` call waited ~3s for weight loading
+before starting GPU compute. Total: ~3295ms (weight loading + GPU compute).
+
+**After**: Weight loading runs in parallel with engine creation. First
+`visionForward` call only pays GPU compute cost. Total: ~2749ms.
+
+**Improvement**: 17% faster (2749ms vs 3295ms min, 234 patches).
+
+**Implementation**: The weight loading trigger code was moved from
+`visionForward` to right after `S_`, `CD`, `CS`, `U` constant definitions
+in `createEngine`. The `visionForward` function now just awaits the
+existing loading promise.
