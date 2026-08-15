@@ -1356,21 +1356,77 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     pass.end()
     return out
   }
-  function ropeBufs(posBase: number, S: number): { cos: GPUBuffer; sin: GPUBuffer } {
+  // M-RoPE sections for Qwen3-VL multimodal models. When present, the model uses IMROPE
+  // (interleaved multi-modal RoPE): each frequency pair j uses one of 4 position dimensions
+  // (t, h, w, z) based on j % 3, and the rotation is interleaved (GPT-J style) not halved.
+  const mropeSections = A.rope?.mrope_sections
+  const isMrope = !!mropeSections
+
+  function ropeBufs(posBase: number, S: number, mropePositions?: Float32Array): { cos: GPUBuffer; sin: GPUBuffer } {
     const D = ROPE_D, // full head_dim for dense qwen3; the partial rotary_dim for the hybrid
       R = D / 2, // rotary halves: caches store [seq, D/2]; the full vector is concat(half, half)
       cos = new Float32Array(S * D),
       sin = new Float32Array(S * D)
-    for (let s = 0; s < S; s++)
-      for (let d = 0; d < D; d++) {
-        cos[s * D + d] = cosCache[(posBase + s) * R + (d % R)]
-        sin[s * D + d] = sinCache[(posBase + s) * R + (d % R)]
+    if (isMrope && mropePositions) {
+      // IMROPE: each frequency pair j uses a position from one of 4 dimensions (t, h, w, z).
+      // Sections [st, sh, sw, sz] split the R pairs into groups; within the first st+sh+sw pairs,
+      // the dimension cycles t/h/w based on j % 3 (interleaved sections, NOT interleaved rotation).
+      // The rotation itself is halved (NEOX style): rope_partial reads cos[s*D + d] = cos_2d_half.
+      // So we fill both halves of the D-dim cos/sin vector with the same R values (per-pair position).
+      const [st, sh, sw, sz] = mropeSections!
+      const sectDims = st + sh + sw + sz
+      for (let s = 0; s < S; s++) {
+        const pt = mropePositions[s * 4 + 0]
+        const px = mropePositions[s * 4 + 1]
+        const py = mropePositions[s * 4 + 2]
+        const pz = mropePositions[s * 4 + 3]
+        for (let j = 0; j < R; j++) {
+          // Pick which position dimension this frequency pair uses (IMROPE cycling)
+          let pos: number
+          if (j < sectDims) {
+            const sector = j % 3
+            if (sector === 1 && j < 3 * sh) pos = py      // h
+            else if (sector === 2 && j < 3 * sw) pos = px  // w
+            else if (sector === 0 && j < 3 * st) pos = pt  // t
+            else pos = pz                                   // z fallback
+          } else {
+            pos = pz
+          }
+          const c = cosCache[pos * R + j]
+          const sn = sinCache[pos * R + j]
+          // Halved rotation: both halves of the D-dim vector use the same R cos/sin values
+          cos[s * D + j] = c
+          cos[s * D + R + j] = c
+          sin[s * D + j] = sn
+          sin[s * D + R + j] = sn
+        }
       }
+    } else {
+      for (let s = 0; s < S; s++)
+        for (let d = 0; d < D; d++) {
+          cos[s * D + d] = cosCache[(posBase + s) * R + (d % R)]
+          sin[s * D + d] = sinCache[(posBase + s) * R + (d % R)]
+        }
+    }
     const cb = actBuf(S * D),
       sb = actBuf(S * D)
     device.queue.writeBuffer(cb, 0, cos)
     device.queue.writeBuffer(sb, 0, sin)
     return { cos: cb, sin: sb }
+  }
+
+  // Build M-RoPE positions for a sequence of text tokens: all 4 dims = sequential position.
+  // Image tokens override their entries with 2D grid positions (see generateWithImages).
+  function mropeTextPositions(posBase: number, S: number): Float32Array {
+    const pos = new Float32Array(S * 4)
+    for (let s = 0; s < S; s++) {
+      const p = posBase + s
+      pos[s * 4 + 0] = p  // t
+      pos[s * 4 + 1] = p  // x (h in ggml convention)
+      pos[s * 4 + 2] = p  // y (w in ggml convention)
+      pos[s * 4 + 3] = p  // z
+    }
+    return pos
   }
 
   const KV = A.kv_heads,
@@ -2006,8 +2062,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     }
   }
 
-  function stack(enc: GPUCommandEncoder, h: GPUBuffer, S: number, posBase: number): { fn: GPUBuffer; layer0: GPUBuffer | null } {
-    const { cos, sin } = ropeBufs(posBase, S)
+  function stack(enc: GPUCommandEncoder, h: GPUBuffer, S: number, posBase: number, mropePositions?: Float32Array): { fn: GPUBuffer; layer0: GPUBuffer | null } {
+    const { cos, sin } = ropeBufs(posBase, S, mropePositions)
     const pass = enc.beginComputePass()
     // Arena reuse (see the arena block above) is poolless-path only - the decode loop has its own
     // slot pool. Protected from recycling: the caller's input `h` (forward() reads the embed batch
@@ -2066,7 +2122,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         const seg = ids.slice(off, off + prefillSeg)
         const enc = device.createCommandEncoder()
         const embedOut = embedBatch(enc, seg)
-        const { fn, layer0: l0 } = stack(enc, embedOut, seg.length, off)
+        const { fn, layer0: l0 } = stack(enc, embedOut, seg.length, off, isMrope ? mropeTextPositions(off, seg.length) : undefined)
         const lg = device.createBuffer({ size: seg.length * vocab * 4, usage: S_ | CS })
         transients.push(lg)
         const pass = enc.beginComputePass()
@@ -2096,7 +2152,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // blocks the GPU for whole seconds. Returns the LAST segment's final-norm buffer + the final
   // token's row within it, or null when aborted (fullHistory is cleared: K/V is only partially
   // written, so nothing may reuse the sequence).
-  async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal, imgInj?: { positions: number[]; embeds: GPUBuffer }): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
+  async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal, imgInj?: { positions: number[]; embeds: GPUBuffer }, mropePositions?: Float32Array): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
     const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
@@ -2157,7 +2213,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
             transients?.push(posBuf, segEmbeds)
           }
         }
-        fn = stack(enc, embedOut, seg.length, posBase + off).fn
+        // For M-RoPE, extract this segment's 4D positions [segLen, 4] from the full array
+        const segMrope = mropePositions
+          ? mropePositions.subarray(off * 4, (off + seg.length) * 4)
+          : undefined
+        fn = stack(enc, embedOut, seg.length, posBase + off, segMrope).fn
         lastRow = seg.length - 1
         device.queue.submit([enc.finish()])
       } finally {
@@ -2233,7 +2293,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           let pass = enc.beginComputePass(tsOn && j === 0 ? { timestampWrites: { querySet: tsQ(), beginningOfPassWriteIndex: 0 } } : undefined)
           runN(pass, 'embed_gather', [['u', Hd], ['u', idxOut - 1], ['u', 0], ['u', 0]], [tokBuf, embWqG, tgt4G, embScalesG, embZpG], embG, 1)
           pass.end()
-          const r = stack(enc, embG, 1, pos)
+          const r = stack(enc, embG, 1, pos, isMrope ? mropeTextPositions(pos, 1) : undefined)
           const last = actBuf(Hd)
           enc.copyBufferToBuffer(r.fn, 0, last, 0, Hd * 4)
           pass = enc.beginComputePass(tsOn && j === batch - 1 ? { timestampWrites: { querySet: tsQ(), endOfPassWriteIndex: 1 } } : undefined)
@@ -2543,7 +2603,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         let p2 = enc.beginComputePass()
         runN(p2, 'embed_gather', [['u', Hd], ['u', idxOut - 1], ['u', 0], ['u', 0]], [tokBuf, embWqG, tgt4G, embScalesG, embZpG], embG, 1)
         p2.end()
-        const r = stack(enc, embG, 1, pos)
+        const r = stack(enc, embG, 1, pos, isMrope ? mropeTextPositions(pos, 1) : undefined)
         const last = actBuf(Hd)
         enc.copyBufferToBuffer(r.fn, 0, last, 0, Hd * 4)
         p2 = enc.beginComputePass()
@@ -2737,7 +2797,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         const gp = enc.beginComputePass()
         run(gp, 'embed_gather_batch', [['u', S], ['u', Hd], ['u', 0], ['u', 0]], [pldIds, embWqG, tgt4G, embScalesG, embZpG], embIn, S * Hd)
         gp.end()
-        const r = stack(enc, embIn, S, pos)
+        const r = stack(enc, embIn, S, pos, isMrope ? mropeTextPositions(pos, S) : undefined)
         pass = enc.beginComputePass()
         lmHead(pass, r.fn, S, lgAll)
         pass.end()
@@ -2844,7 +2904,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     await ensureKvCapacity(prefillIds.length + 1)
     transients = []
     const encP = device.createCommandEncoder()
-    stack(encP, embedBatch(encP, prefillIds), prefillIds.length, 0)
+    stack(encP, embedBatch(encP, prefillIds), prefillIds.length, 0, isMrope ? mropeTextPositions(0, prefillIds.length) : undefined)
     device.queue.submit([encP.finish()])
     await device.queue.onSubmittedWorkDone()
     const pos = prefillIds.length,
@@ -2853,7 +2913,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       FORCE_SLOW = forceSlow
       DBG0 = {}
       const enc = device.createCommandEncoder()
-      const r = stack(enc, embedBatch(enc, [tok]), 1, pos)
+      const r = stack(enc, embedBatch(enc, [tok]), 1, pos, isMrope ? mropeTextPositions(pos, 1) : undefined)
       const lg = device.createBuffer({ size: W.lm_head.N! * 4, usage: S_ | CS })
       transients?.push(lg)
       const pass = enc.beginComputePass()
@@ -2913,7 +2973,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const banBuf = upload(ban.length ? Uint32Array.from(ban) : new Uint32Array(1), S_ | CD)
     // pass 1: prefill -> lm_head -> base logits
     const enc1 = device.createCommandEncoder()
-    const { fn } = stack(enc1, embedBatch(enc1, ids), ids.length, 0)
+    const { fn } = stack(enc1, embedBatch(enc1, ids), ids.length, 0, isMrope ? mropeTextPositions(0, ids.length) : undefined)
     const lastP = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
     transients?.push(lastP)
     enc1.copyBufferToBuffer(fn, (ids.length - 1) * Hd * 4, lastP, 0, Hd * 4)
@@ -3181,6 +3241,32 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const hist = [...promptTokenIds]
     fullHistory = hist
 
+    // 2b. Compute M-RoPE positions for the full prompt (text + image tokens).
+    // For text tokens: all 4 dims = sequential position.
+    // For image tokens: t = pos_0 (base of image), x = pos_0 + col, y = pos_0 + row, z = 0.
+    // Each image's tokens form a ny×nx grid (from visResult.imageGrids).
+    let mropePositions: Float32Array | undefined
+    if (isMrope) {
+      mropePositions = mropeTextPositions(posBase, prefillTokens.length)
+      // Overwrite image token positions with 2D grid positions
+      let imgIdx = 0
+      for (let img = 0; img < visResult.imageGrids.length; img++) {
+        const [nx, ny] = visResult.imageGrids[img]
+        const imgStart = imagePositions[imgIdx]
+        for (let i = 0; i < nx * ny; i++) {
+          const pos = imagePositions[imgIdx + i]
+          const t = imgStart           // temporal: base position of this image
+          const x = imgStart + (i % nx) // column
+          const y = imgStart + Math.floor(i / nx) // row
+          mropePositions[pos * 4 + 0] = t
+          mropePositions[pos * 4 + 1] = x
+          mropePositions[pos * 4 + 2] = y
+          mropePositions[pos * 4 + 3] = 0  // z unused
+        }
+        imgIdx += nx * ny
+      }
+    }
+
     try {
       await ensureKvCapacity(posBase + prefillTokens.length + 1)
       transients = []
@@ -3194,7 +3280,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           const prefillImgInj = prefillImgPositions.length > 0
             ? { positions: prefillImgPositions, embeds: visionEmbedsBuf }
             : undefined
-          await runPrefill(prefillTokens.slice(0, -1), posBase, genOpts.signal, prefillImgInj)
+          await runPrefill(prefillTokens.slice(0, -1), posBase, genOpts.signal, prefillImgInj, mropePositions)
           await device.queue.onSubmittedWorkDone()
         }
         cacheLen = posBase + prefillTokens.length - 1
@@ -3464,7 +3550,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       runN(pass0, 'embed_gather', [['u', Hd], ['u', 0], ['u', 0], ['u', 0]], [tokBuf, embWqG, tgt4G, embScalesG, embZpG], embG, 1)
       pass0.end()
       // stack: runs all 28 layers (the main shader-heavy path)
-      const { fn } = stack(enc, embG, 1, 0)
+      const { fn } = stack(enc, embG, 1, 0, isMrope ? mropeTextPositions(0, 1) : undefined)
       // lm_head + argmax: completes the decode pipeline
       const lg = device.createBuffer({ size: W.lm_head.N! * 4, usage: S_ | CS })
       const pass1 = enc.beginComputePass()
@@ -3514,6 +3600,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     // Process each image: CPU preprocess → GPU forward
     const allEmbeds: Float32Array[] = []
     const allNumMerged: number[] = []
+    const allGrids: [number, number][] = []
 
     for (const image of images) {
       // CPU preprocessing (one-time per image)
@@ -3812,6 +3899,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const imageEmbeds = await readback(imageEmbedsBuf, numMerged * projDim)
       allEmbeds.push(imageEmbeds)
       allNumMerged.push(numMerged)
+      allGrids.push([mergedW, mergedH])
 
       // Cleanup per-image buffers (after submit + readback, so GPU is done with them)
       normedBuf.destroy(); normed2Buf.destroy()
@@ -3835,6 +3923,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     return {
       imageEmbeds,
       numPatches: totalMerged,
+      imageGrids: allGrids,
       deepstackFeatures: [],
       elapsedMs,
     }

@@ -236,6 +236,13 @@ function buildManifest(h: Header, dataFile: string): Manifest {
   } else if (scalingType !== undefined && scalingType !== 'none') {
     throw new Error(`bitgpu/gguf: unsupported rope scaling '${scalingType}'`)
   }
+  // M-RoPE / IMROPE: Qwen3-VL uses multi-modal RoPE with 4 section dimensions.
+  // The sections split the rotary_dim into temporal, height, width, and z components.
+  // IMROPE (interleaved) cycles through t/h/w per frequency pair; standard MROPE uses contiguous blocks.
+  const ropeSections = meta[`${archName}.rope.dimension_sections`]
+  if (Array.isArray(ropeSections) && ropeSections.length === 4) {
+    rope.mrope_sections = [Number(ropeSections[0]), Number(ropeSections[1]), Number(ropeSections[2]), Number(ropeSections[3])]
+  }
 
   /** The interleaved Q1_0 byte range of a tensor inside the GGUF (used unchanged). */
   const region = (gname: string, N: number, K: number): ManifestRef => {
@@ -350,6 +357,11 @@ function buildQwen35Manifest(h: Header, dataFile: string): Manifest {
   if (!embd) throw new Error('bitgpu/gguf: header has no token_embd.weight tensor')
   const vocab = embd.dims[1]
   const tied = !('output.weight' in gg)
+  // M-RoPE / IMROPE sections for Qwen3-VL multimodal models
+  const ropeSections = meta['qwen35.rope.dimension_sections']
+  const mropeSections = (Array.isArray(ropeSections) && ropeSections.length === 4)
+    ? [Number(ropeSections[0]), Number(ropeSections[1]), Number(ropeSections[2]), Number(ropeSections[3])] as [number, number, number, number]
+    : undefined
 
   const region = (gname: string, N: number, K: number): ManifestRef => {
     const t = gg[gname]
@@ -427,7 +439,7 @@ function buildQwen35Manifest(h: Header, dataFile: string): Manifest {
       model_type: 'qwen3_5', layers, hidden, intermediate: inter,
       heads, kv_heads: kvHeads, head_dim: headDim,
       rms_eps: Number(P('attention.layer_norm_rms_epsilon')),
-      rope: { rope_theta: Number(P('rope.freq_base')) }, max_positions: Number(P('context_length')),
+      rope: { rope_theta: Number(P('rope.freq_base')), ...(mropeSections ? { mrope_sections: mropeSections } : {}) }, max_positions: Number(P('context_length')),
       vocab, eos: Number(eos), tie_word_embeddings: tied, act: 'silu',
       hybrid: {
         layer_types, linear_key_heads: nkHeads, linear_value_heads: nvHeads,

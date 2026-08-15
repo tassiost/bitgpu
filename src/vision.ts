@@ -506,7 +506,10 @@ export async function loadVisionWeights(
     const end = Math.min((i + 1) * chunkSize, dataEnd)
     if (end <= start) return
     const buf = await fetchFn(mmprojUrl, dataStart + start, end - start)
-    bulkData.set(new Uint8Array(buf), start)
+    // The server may return more/fewer bytes than requested (e.g. no range support);
+    // slice to the expected length to avoid offset-out-of-bounds on bulkData.set.
+    const chunk = new Uint8Array(buf, 0, Math.min(buf.byteLength, end - start))
+    bulkData.set(chunk, start)
   }))
 
   // 4. Load all tensors from the pre-fetched bulk buffer
@@ -536,16 +539,16 @@ export async function loadVisionWeights(
         data = new Float32Array(raw.buffer, raw.byteOffset, elems)
         break
       case GGUF_F16:
-        // Skip f32 dequantization — GPU shaders use raw f16 bytes directly.
-        // The f32 data is only needed for the non-F16 fallback path, which
-        // is never taken when F16 weights are available.
-        data = new Float32Array(0)
+        // Dequantize F16 to F32 for CPU reference path.
+        // GPU shaders use raw f16 bytes directly via repackF16().
+        data = dequantF16(raw, elems, 1)
         return { name: t.name, data, dims, raw, type: GGUF_F16 }
       case GGUF_Q8_0: {
-        // Skip f32 dequantization — GPU shaders use raw Q8 bytes directly.
-        // The f32 data is only needed for the non-Q8 fallback path, which
-        // is never taken when Q8 weights are available.
-        data = new Float32Array(0)
+        // Dequantize Q8_0 to F32 for CPU reference path.
+        // GPU shaders use raw Q8 bytes directly via repackQ8_0().
+        const q8N = dims.length >= 2 ? dims[1] : 1
+        const q8K = dims[0]
+        data = dequantQ8_0(raw, q8N, q8K)
         return { name: t.name, data, dims, raw, type: GGUF_Q8_0 }
       }
       default:
@@ -1332,6 +1335,7 @@ export function visionForwardCpu(
   // Process each image
   const allImageEmbeds: Float32Array[] = []
   const allNumMerged: number[] = []
+  const allGrids: [number, number][] = []
 
   for (const image of images) {
     // 1. Preprocess → patches
@@ -1430,6 +1434,7 @@ export function visionForwardCpu(
 
     allImageEmbeds.push(imageEmbeds)
     allNumMerged.push(numMerged)
+    allGrids.push([mergedW, mergedH])
   }
 
   // Concatenate all image embeddings
@@ -1445,6 +1450,7 @@ export function visionForwardCpu(
   return {
     imageEmbeds,
     numPatches: totalMerged,
+    imageGrids: allGrids,
     deepstackFeatures: [],  // No DeepStack — is_deepstack_layers is all false
     elapsedMs,
   }

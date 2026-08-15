@@ -48,7 +48,7 @@ export interface ManifestArch {
   act: string
   tie_word_embeddings?: boolean
   /** rope parameters for manifests without baked cos/sin caches (v2/GGUF) */
-  rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number }
+  rope?: { rope_theta: number; rope_type?: string; factor?: number; original_max_position_embeddings?: number; mrope_sections?: [number, number, number, number] }
   /** position cap for synthesized rope (GGUF context_length) */
   max_positions?: number
   /** Hybrid backbone (qwen3_5 / GGUF `qwen35`): a per-layer mix of gated-DeltaNet linear
@@ -441,6 +441,9 @@ export interface VisionForwardResult {
   imageEmbeds: Float32Array
   /** Number of merged patches (= imageEmbeds.length / out_hidden_size). */
   numPatches: number
+  /** Merged grid dimensions [nx, ny] per image (after spatial_merge_size downsampling).
+   *  Used for M-RoPE position computation: each image's tokens form a ny×nx grid. */
+  imageGrids: [number, number][]
   /** DeepStack features from ViT layers [8, 16, 24].
    *  Each entry is [num_merged_patches, out_hidden_size].
    *  Injected into LLM layers 0, 1, 2 respectively. Empty if DeepStack is not used. */
