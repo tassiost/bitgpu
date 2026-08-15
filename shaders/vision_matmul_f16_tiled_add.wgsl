@@ -12,7 +12,7 @@ enable f16;
 
 const BM: u32 = 64u;
 const BN: u32 = 64u;
-const BKV: u32 = 4u;  // BK / 4 (BK = 16)
+const BKV: u32 = 8u;  // BK / 4 (BK = 32)
 
 struct Params {
   M: u32,        // number of input rows (num_patches)
@@ -29,8 +29,8 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> out: array<f32>;  // [M, N]
 @group(0) @binding(5) var<storage, read> residual: array<f32>;   // [M, N]
 
-var<workgroup> xs: array<vec4<f32>, 256>;  // BM * BKV
-var<workgroup> ws: array<vec4<f32>, 256>;  // BN * BKV
+var<workgroup> xs: array<vec4<f32>, 512>;  // BM * BKV
+var<workgroup> ws: array<vec4<f32>, 512>;  // BN * BKV
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {

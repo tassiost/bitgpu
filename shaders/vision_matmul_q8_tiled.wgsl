@@ -27,7 +27,7 @@ struct Params {
 
 const BM: u32 = 64u;
 const BN: u32 = 64u;
-const BKV: u32 = 4u;  // BK / 4 (BK = 16, processed as 4 vec4 steps)
+const BKV: u32 = 8u;  // BK / 4 (BK = 32, processed as 8 vec4 steps)
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<f32>;          // [M, K]
@@ -38,8 +38,8 @@ const BKV: u32 = 4u;  // BK / 4 (BK = 16, processed as 4 vec4 steps)
 @group(0) @binding(6) var<storage, read_write> out1: array<f32>;
 @group(0) @binding(7) var<storage, read_write> out2: array<f32>;
 
-var<workgroup> xs: array<vec4<f32>, 256>;  // BM * BKV = 64 * 4 = 256
-var<workgroup> ws: array<vec4<f32>, 256>;  // BN * BKV = 64 * 4 = 256
+var<workgroup> xs: array<vec4<f32>, 512>;  // BM * BKV = 64 * 8 = 512
+var<workgroup> ws: array<vec4<f32>, 512>;  // BN * BKV = 64 * 8 = 512
 
 @compute @workgroup_size(256)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
