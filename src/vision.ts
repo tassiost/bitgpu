@@ -496,21 +496,18 @@ export async function loadVisionWeights(
   }
   // Parallel fetch: split the data into 4 chunks and fetch concurrently.
   // This improves throughput by 2-3x on localhost (bypasses per-request overhead).
+  // Fetch directly into a single pre-allocated buffer to avoid doubling memory
+  // (chunks + concatenation copy would be ~1.2GB for the 629MB mmproj).
   const NUM_CHUNKS = 4
   const chunkSize = Math.ceil(dataEnd / NUM_CHUNKS)
-  const chunks = new Array<Uint8Array>(NUM_CHUNKS)
+  const bulkData = new Uint8Array(dataEnd)
   await Promise.all(Array.from({ length: NUM_CHUNKS }, async (_, i) => {
     const start = i * chunkSize
     const end = Math.min((i + 1) * chunkSize, dataEnd)
-    if (end <= start) { chunks[i] = new Uint8Array(0); return }
+    if (end <= start) return
     const buf = await fetchFn(mmprojUrl, dataStart + start, end - start)
-    chunks[i] = new Uint8Array(buf)
+    bulkData.set(new Uint8Array(buf), start)
   }))
-  // Concatenate chunks into a single buffer
-  const totalLen = chunks.reduce((a, c) => a + c.length, 0)
-  const bulkData = new Uint8Array(totalLen)
-  let off = 0
-  for (const c of chunks) { bulkData.set(c, off); off += c.length }
 
   // 4. Load all tensors from the pre-fetched bulk buffer
   const depth = config.depth
