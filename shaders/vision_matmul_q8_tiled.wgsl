@@ -27,7 +27,7 @@ struct Params {
 
 const BM: u32 = 64u;
 const BN: u32 = 64u;
-const BKV: u32 = 8u;  // BK / 4 (BK = 32, processed as 8 vec4 steps)
+const BKV: u32 = 8u;  // BK = 32 (processed as 8 vec4 steps)
 
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> x: array<f32>;          // [M, K]

@@ -6,7 +6,7 @@
 // Inner compute loops manually unrolled for Apple Silicon.
 const BM: u32 = 64u;
 const BN: u32 = 64u;
-const BKV: u32 = 8u;
+const BKV: u32 = 8u;  // BK = 32 (processed as 8 vec4 steps)
 const GELU_COEF: f32 = 0.7978845608028654;
 
 struct Params {

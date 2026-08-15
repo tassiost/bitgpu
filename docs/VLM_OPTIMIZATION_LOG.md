@@ -994,3 +994,116 @@ before starting GPU compute. Total: ~3295ms (weight loading + GPU compute).
 `visionForward` to right after `S_`, `CD`, `CS`, `U` constant definitions
 in `createEngine`. The `visionForward` function now just awaits the
 existing loading promise.
+
+### Multi-subgroup sgmat shader wiring (2025-01-24)
+
+Wired up the multi-subgroup sgmat (tensor core) shaders with 8 subgroups
+per workgroup (16×32 workgroup tile, TILE_K=32, 4 K-steps per load).
+
+**Result**: The `chromium_experimental_subgroup_matrix` extension is NOT
+available in the current Chrome environment, so the shaders fall back to
+the manual FMA tiled shaders. The sgmat code is compiled only when the
+extension is detected via `navigator.gpu.wgslLanguageFeatures`.
+
+**Available WGSL features** (detected):
+- `packed_4x8_integer_dot_product` (DP4a) — available!
+- `subgroup_uniformity`, `subgroup_id` — available
+- `chromium_experimental_subgroup_matrix` — NOT available
+
+**Key learning**: The sgmat shaders are wired but dormant. The fallback
+path (64×64 manual FMA tiled) is the active code path.
+
+### TILE_K=64 for sgmat (REVERTED — slower)
+
+Tried doubling TILE_K from 32 to 64 in sgmat shaders (8 K-steps per load,
+halving barrier count). Shared memory: 384 bytes → 768 bytes (still tiny).
+
+**Result**: 1629ms for 4 patches (vs 271ms with TILE_K=32) — 6× slower.
+The larger K tile reduces occupancy or causes register pressure.
+
+### 4×2 subgroup layout (32×16 tile) (REVERTED — slower)
+
+Tried SUBGROUP_M=4, SUBGROUP_N=2 (32×16 workgroup tile) to increase M tile
+and reduce W re-reads.
+
+**Result**: 2059ms for 4 patches (vs 271ms with 2×4 layout) — 7.6× slower.
+The 32×16 tile is worse because it reduces N parallelism (fewer N tiles
+to parallelize across workgroups).
+
+### 4×4 subgroup layout (32×32 tile, 512 threads) (REVERTED — slower)
+
+Tried SUBGROUP_M=4, SUBGROUP_N=4 (32×32 workgroup tile, 16 subgroups,
+512 threads per workgroup).
+
+**Result**: 1972ms for 4 patches (vs 271ms with 2×4 layout) — 7.3× slower.
+512 threads per workgroup reduces occupancy on Apple Silicon.
+
+### BKV=16 for tiled shaders (REVERTED — exceeds 16KB limit)
+
+Tried doubling BKV from 8 to 16 in the 64×64 tiled Q8 shaders (BK=64,
+halving barrier count). Shared memory: 16KB → 32KB.
+
+**Result**: Failed — exceeds the default 16KB workgroup storage limit.
+The adapter supports 32KB but requesting it reduces GPU occupancy
+(documented in engine.ts comment from prior testing).
+
+### Fused LayerNorm + QKV matmul (REVERTED — slower)
+
+Created `vision_matmul_q8_tiled_ln.wgsl` that fuses LayerNorm1 into the
+QKV matmul, eliminating 27 LayerNorm dispatches and 27 global memory
+round-trips (4.3MB write + 4.3MB read per layer = 232MB total).
+
+**Approach**: Each workgroup (64 rows, 256 threads) cooperatively computes
+LayerNorm for its 64 rows using 4 threads per row, then applies LN
+on-the-fly during the X tile load.
+
+**Challenges**:
+1. Required 9 storage buffers (vs 8 default limit) — needed to request
+   `maxStorageBuffersPerShaderStage = 10`
+2. Required 17.9KB workgroup storage (vs 16KB default) — needed to request
+   `maxComputeWorkgroupStorageSize = 32768`
+3. The LayerNorm reduction adds 3 barriers + 2 full-row scans per
+   workgroup, which is redundant across workgroups (each WG computes LN
+   for its 64 rows, but only 16 rows are unique per QKV tile)
+
+**Result**: 4108ms for 234 patches (vs 3228ms baseline) — 27% slower.
+The overhead of:
+- Requesting 32KB workgroup storage (reduces occupancy)
+- Redundant LN computation across workgroups
+- Extra barriers for LN reduction
+...outweighs the savings from eliminating 27 dispatches.
+
+**Key learning**: Kernel fusion in WebGPU is NOT always beneficial when:
+1. It requires requesting higher device limits (reduces occupancy)
+2. The fused operation requires a full-row reduction (barriers)
+3. The reduction is redundant across workgroups
+The dispatch overhead (~50µs × 27 = 1.4ms) is small compared to the
+compute overhead of redundant reductions.
+
+### Research findings (2025-01-24)
+
+Researched latest WebGPU VLM optimization techniques. Key findings:
+
+1. **DP4a (dot4I8Packed)**: Available in current Chrome! Could provide
+   1.6-2.8× speedup for Q8 dequantization. But requires both operands
+   to be packed int8 — our X is f32, so can't directly use DP4a.
+
+2. **Q8_0 weight reordering**: Separating scales from data could provide
+   2-3× speedup (Intel SYCL data). Our layout already separates scales
+   from data (packed + scales in different arrays), so this is already
+   partially done.
+
+3. **F16 activations**: Could save 458MB bandwidth (50% of activation BW).
+   Requires changing every shader that reads/writes activations. Big
+   change, medium impact.
+
+4. **Dispatch overhead**: 32-71µs per dispatch on Metal. Our 216 dispatches
+   = 7-15ms overhead (0.2-0.5% of total). Not a major bottleneck.
+
+5. **Subgroup matrix**: 3× speedup on M2 for 1024×1024 matmul (ONNX data).
+   But requires `chromium_experimental_subgroup_matrix` which is NOT
+   available in our Chrome environment.
+
+6. **Kernel fusion**: ONNX Runtime shows 25-30% speedup from fusion. But
+   our fused LN+QKV experiment showed fusion can be slower when it
+   requires higher device limits or redundant computation.
