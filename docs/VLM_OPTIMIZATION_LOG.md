@@ -701,3 +701,62 @@ bottleneck — the CPU loading was.
 **Lesson**: Always profile the full pipeline before optimizing individual
 kernels. The matmul shader optimizations (BM=128, BKV=2, hybrid shared memory)
 all failed because they targeted the wrong bottleneck.
+
+### 2026-08-15: Parallel fetch + fast f16/repack (incremental, KEPT)
+**Weight loading breakdown** (from profiling):
+- HTTP fetch: 1552ms (600MB at 386MB/s) — 64% of loading
+- Parse+repack: 449ms — 19%
+- GPU upload: 427ms — 17%
+
+**Optimizations**:
+1. **Parallel fetch**: Split the 600MB bulk fetch into 4 concurrent HTTP Range
+   requests. Best case: 1552ms → 1170ms (24% faster). On localhost, this
+   bypasses per-request overhead. In production with CORS proxy, the gain
+   may be larger (more per-request latency to amortize).
+
+2. **Fast f16ToF32**: Replaced `Math.pow`-based f16→f32 conversion with
+   bit-level manipulation using a shared ArrayBuffer. ~5-10× faster per call.
+
+3. **Fast repackQ8_0**: Replaced DataView with direct Uint8Array/Uint16Array
+   access. Eliminates per-element function call overhead.
+
+**Files changed**: `src/vision.ts`
+
+**Note**: Benchmark results were noisy due to system load (chrome-devtools-mcp
+running 22 Chrome processes). Best-case vision tower: 3262ms. Accuracy
+preserved across all runs.
+
+### 2026-08-15: BKV and hybrid approach experiments (TESTED, REVERTED)
+**Attempted 3 shader changes to the Q8 tiled and F16 tiled add shaders:**
+
+1. **Q8 tiled BKV 2→4**: Changed BKV from 2 to 4 in the hybrid Q8 tiled shader
+   (W only in shared). The shared array was already sized for BKV=4 (256 vec4).
+   **Result**: Accuracy broke completely — LLM described "grid of colorful
+   icons" instead of "screenshot of social media post". Root cause unclear;
+   the indexing logic appears correct. Possibly a WGSL compiler bug on Apple
+   Silicon with hybrid + BKV=4.
+
+2. **F16 tiled add shared memory 512→256**: Reduced the shared memory array
+   from 512 to 256 vec4 (8KB→4KB). **Result**: Same accuracy breakage. Root
+   cause: the F16 shader actually has BKV=8 (not 4 as initially misread from
+   grep output), so it needs 64*8=512 elements. Reducing to 256 caused
+   out-of-bounds shared memory access.
+
+3. **Reverted all shader changes**: Restored both shaders to their committed
+   state (non-hybrid, BKV=4, both X+W in shared, 8KB). Accuracy restored.
+
+**Lesson**: Always verify the actual BKV value before changing shared memory
+array sizes. The grep output can be misleading when multiple shaders have
+similar constant names. Use `git show HEAD:path/to/shader` to verify the
+committed state.
+
+**Current shader state** (all committed, all correct):
+- Q8 tiled (QKV): BKV=4, both X+W in shared (8KB), split outputs
+- Q8 tiled add (attnOut): BKV=4, both X+W in shared (8KB)
+- Q8 tiled gelu (FFN up): BKV=4, both X+W in shared (8KB)
+- F16 tiled add (FFN down): BKV=4, both X+W in shared (8KB)
+
+**GPU forward pass**: ~1420ms for 27 layers (52ms/layer). This is 24× slower
+than the compute roofline (60.3ms). The gap is due to Q8 dequantization
+overhead (~4.5 instructions per FMA), shared memory barriers, and low
+occupancy (8KB shared = 2 WGs/core at 16KB limit).
