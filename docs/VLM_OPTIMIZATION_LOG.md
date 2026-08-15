@@ -802,3 +802,31 @@ is the sweet spot for localhost.
 `unpack4x8snorm(packed) * (scale * 127.0)` instead of manual sign-extension
 was significantly slower (avg 5278ms vs 3502ms). The builtin appears to be
 less efficient than manual bit manipulation on Apple Silicon's Metal backend.
+
+### 2026-08-16: Attention unrolling + explicit FMA (COMMITTED)
+
+**Attention shader unrolling**: Manually unrolled the d4 (0..17) loops in
+vision_attention.wgsl (Q load, acc init, Q·K dot, V accumulation, output write,
+cooperative K/V load). Result: avg 3502ms → 3433ms (2% faster).
+
+**Explicit multiply-add**: Replaced vec4 `dot()` with explicit scalar
+multiply-add (`xr.x*w.x + xr.y*w.y + ...`) in all 4 tiled matmul shaders.
+Gives the Metal compiler more freedom to schedule FMA instructions.
+Result: avg 3433ms → 3295ms (4% faster), min 3227ms → 3157ms (2.2% faster).
+
+**Full kv loop unrolling**: Tested and reverted. Unrolling the kv loop
+(8 iterations) in the compute section caused register spilling and was
+slower (avg 4061ms vs 3433ms, 18% slower).
+
+**Hybrid shared memory (BKV=16, W only)**: Tested and reverted. Only storing
+W in shared memory (not X) allows BKV=16 with 16KB shared, halving barriers.
+But the extra global memory reads for X (8× more reads per K iteration)
+outweigh the barrier savings. Avg 3616ms vs 3295ms (10% slower).
+
+### Current best: 3157ms min, 3295ms avg (from ~4877ms avg at session start)
+
+Cumulative improvement: ~32% faster vision tower forward pass through:
+1. Manual tm/tn loop unrolling (12%)
+2. BKV=8 full Q8_0 block processing (18%)
+3. Attention shader d4 loop unrolling (2%)
+4. Explicit multiply-add replacing dot() (4%)
