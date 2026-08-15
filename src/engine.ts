@@ -315,6 +315,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const adapter = await navigator.gpu.requestAdapter({ powerPreference }) // pick the discrete GPU on multi-GPU machines, not the weak iGPU
   if (!adapter) throw new WebGPUUnavailableError('No suitable WebGPU adapter was found.')
   const hasSG = adapter.features.has('subgroups' as GPUFeatureName)
+  // Check for subgroup_matrix extension (experimental, requires enable-unsafe-webgpu flag)
+  const hasSGMat = !!(navigator.gpu as any).wgslLanguageFeatures?.has('chromium_experimental_subgroup_matrix')
   const info = (adapter.info ?? {}) as GPUAdapterInfo & { subgroupMinSize?: number; subgroupMaxSize?: number } // subgroup sizes live on GPUAdapterInfo
   const sgMax = info.subgroupMaxSize ?? 32
   const sgMin = info.subgroupMinSize ?? sgMax
@@ -542,13 +544,19 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   // Vision tower pipelines (compiled only when the model has a vision config)
   if (visionState) {
     // All vision shaders use fixed @workgroup_size — no overrides needed
-    for (const n of ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
+    const visionShaderNames = ['vision_matmul', 'vision_matmul_tiled', 'vision_matmul_tiled_gelu',
                       'vision_matmul_tiled_add', 'vision_matmul_q8', 'vision_matmul_q8_gelu',
                       'vision_matmul_q8_add', 'vision_matmul_q8_tiled', 'vision_matmul_q8_tiled_gelu',
                       'vision_matmul_q8_tiled_add', 'vision_matmul_f16_add', 'vision_matmul_f16_tiled_add',
                       'vision_layernorm', 'vision_gelu', 'vision_add',
                       'vision_patch_embed', 'vision_patch_merger', 'vision_attention',
-                      'vision_apply_rope', 'vision_inject'])
+                      'vision_apply_rope', 'vision_inject']
+    // sgmat (tensor core) shaders require chromium_experimental_subgroup_matrix extension
+    if (hasSGMat) {
+      visionShaderNames.push('vision_matmul_q8_sgmat', 'vision_matmul_q8_sgmat_gelu',
+                             'vision_matmul_q8_sgmat_add', 'vision_matmul_f16_sgmat_add')
+    }
+    for (const n of visionShaderNames)
       specs.push([n])
   }
   await Promise.all(specs.map(([n, c]) => mkPipe(n, c))) // parallel compile of all pipelines
@@ -3608,6 +3616,12 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
       // Check if Q8 packed weights are available for in-shader dequantization
       const hasQ8 = !!visionState.weights?.q8
+      // SubgroupMatrix (tensor core) shaders: use 16×32 workgroup tiles with 8 subgroups.
+      // Falls back to 64×64 manual FMA tiled shaders if pipelines aren't available.
+      const useSGMat = !!(pipelines['vision_matmul_q8_sgmat'] && pipelines['vision_matmul_q8_sgmat_add'] &&
+                          pipelines['vision_matmul_q8_sgmat_gelu'] && pipelines['vision_matmul_f16_sgmat_add'])
+      // SGMat workgroup tile: WG_M=16, WG_N=32
+      const sgWG_M = 16, sgWG_N = 32
 
       for (let li = 0; li < depth; li++) {
         const p = `l${li}.`
@@ -3618,8 +3632,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h0, vw.get(p + 'ln1W')!, vw.get(p + 'ln1B')!], normedBuf, numPatches)
 
-        // 2. QKV projection — 2D tiled Q8 if available, else f32
-        if (hasQ8 && vw.get(p + 'qkvWQ')) {
+        // 2. QKV projection — sgmat (tensor core) if available, else 2D tiled Q8, else f32
+        if (useSGMat && hasQ8 && vw.get(p + 'qkvWQ')) {
+          setup(pass, 'vision_matmul_q8_sgmat',
+            [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
+            [normedBuf, vw.get(p + 'qkvWQ')!, vw.get(p + 'qkvWS')!, vw.get(p + 'qkvB')!],
+            [qBuf, kBuf, vBuf])
+          pass.dispatchWorkgroups(Math.ceil(3 * H / sgWG_N), Math.ceil(numPatches / sgWG_M))
+        } else if (hasQ8 && vw.get(p + 'qkvWQ')) {
           setup(pass, 'vision_matmul_q8_tiled',
             [['u', numPatches], ['u', 3 * H], ['u', H], ['u', H], ['u', H], ['u', H], ['u', 1]],
             [normedBuf, vw.get(p + 'qkvWQ')!, vw.get(p + 'qkvWS')!, vw.get(p + 'qkvB')!],
@@ -3645,8 +3665,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           [qRopedBuf, kRopedBuf, vBuf, cuBuf], [attnOut])
         pass.dispatchWorkgroups(numSegments, heads, Math.ceil(framePatches / 32))
 
-        // 4. Attn output proj + residual add — 2D tiled Q8 if available, else f32
-        if (hasQ8 && vw.get(p + 'attnOutWQ')) {
+        // 4. Attn output proj + residual add — sgmat if available, else Q8 tiled, else f32
+        if (useSGMat && hasQ8 && vw.get(p + 'attnOutWQ')) {
+          setup(pass, 'vision_matmul_q8_sgmat_add',
+            [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [attnOut, vw.get(p + 'attnOutWQ')!, vw.get(p + 'attnOutWS')!, vw.get(p + 'attnOutB')!, h0],
+            [h1])
+          pass.dispatchWorkgroups(Math.ceil(H / sgWG_N), Math.ceil(numPatches / sgWG_M))
+        } else if (hasQ8 && vw.get(p + 'attnOutWQ')) {
           setup(pass, 'vision_matmul_q8_tiled_add',
             [['u', numPatches], ['u', H], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
             [attnOut, vw.get(p + 'attnOutWQ')!, vw.get(p + 'attnOutWS')!, vw.get(p + 'attnOutB')!],
@@ -3666,8 +3692,14 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           [['u', numPatches], ['u', H], ['f', eps], ['u', 0]],
           [h1, vw.get(p + 'ln2W')!, vw.get(p + 'ln2B')!], normed2Buf, numPatches)
 
-        // 6. FFN up + GELU — 2D tiled Q8 if available, else f32
-        if (hasQ8 && vw.get(p + 'ffnUpWQ')) {
+        // 6. FFN up + GELU — sgmat if available, else Q8 tiled, else f32
+        if (useSGMat && hasQ8 && vw.get(p + 'ffnUpWQ')) {
+          setup(pass, 'vision_matmul_q8_sgmat_gelu',
+            [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [normed2Buf, vw.get(p + 'ffnUpWQ')!, vw.get(p + 'ffnUpWS')!, vw.get(p + 'ffnUpB')!],
+            [actBuf_])
+          pass.dispatchWorkgroups(Math.ceil(inter / sgWG_N), Math.ceil(numPatches / sgWG_M))
+        } else if (hasQ8 && vw.get(p + 'ffnUpWQ')) {
           setup(pass, 'vision_matmul_q8_tiled_gelu',
             [['u', numPatches], ['u', inter], ['u', H], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
             [normed2Buf, vw.get(p + 'ffnUpWQ')!, vw.get(p + 'ffnUpWS')!, vw.get(p + 'ffnUpB')!],
@@ -3681,9 +3713,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
           pass.dispatchWorkgroups(Math.ceil(inter / 64))
         }
 
-        // 7. FFN down + residual add — 2D tiled f16 if available, else f32
+        // 7. FFN down + residual add — sgmat f16 if available, else f16 tiled, else f32
         //    h0 = h1 + matmul(act, ffnDownW, ffnDownB)
-        if (vw.get(p + 'ffnDownWF16')) {
+        if (useSGMat && vw.get(p + 'ffnDownWF16')) {
+          setup(pass, 'vision_matmul_f16_sgmat_add',
+            [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+            [actBuf_, vw.get(p + 'ffnDownWF16')!, vw.get(p + 'ffnDownB')!, h1],
+            [h0])
+          pass.dispatchWorkgroups(Math.ceil(H / sgWG_N), Math.ceil(numPatches / sgWG_M))
+        } else if (vw.get(p + 'ffnDownWF16')) {
           setup(pass, 'vision_matmul_f16_tiled_add',
             [['u', numPatches], ['u', H], ['u', inter], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
             [actBuf_, vw.get(p + 'ffnDownWF16')!, vw.get(p + 'ffnDownB')!],
@@ -3723,9 +3761,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         [postLn], [shuffled])
       pass.dispatchWorkgroups(numMerged)
 
-      // 6. mm.0 + GELU — Q8 if available, else f32
+      // 6. mm.0 + GELU — sgmat if available, else Q8 tiled, else f32
       const mm0Act = actBuf(numMerged * mergedDim)
-      if (hasQ8 && vw.get('mm0WQ')) {
+      if (useSGMat && hasQ8 && vw.get('mm0WQ')) {
+        setup(pass, 'vision_matmul_q8_sgmat_gelu',
+          [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
+          [shuffled, vw.get('mm0WQ')!, vw.get('mm0WS')!, vw.get('mm0Bias')!],
+          [mm0Act])
+        pass.dispatchWorkgroups(Math.ceil(mergedDim / sgWG_N), Math.ceil(numMerged / sgWG_M))
+      } else if (hasQ8 && vw.get('mm0WQ')) {
         setup(pass, 'vision_matmul_q8_tiled_gelu',
           [['u', numMerged], ['u', mergedDim], ['u', mergedDim], ['u', 1], ['u', 0], ['u', 0], ['u', 0]],
           [shuffled, vw.get('mm0WQ')!, vw.get('mm0WS')!, vw.get('mm0Bias')!],
@@ -3739,9 +3783,15 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         pass.dispatchWorkgroups(Math.ceil(mergedDim / 64))
       }
 
-      // 7. mm.2: linear(4608→5120) + bias — 2D tiled Q8 if available, else f32
+      // 7. mm.2: linear(4608→5120) + bias — sgmat if available, else Q8 tiled, else f32
       const imageEmbedsBuf = actBuf(numMerged * projDim)
-      if (hasQ8 && vw.get('mm2WQ')) {
+      if (useSGMat && hasQ8 && vw.get('mm2WQ')) {
+        setup(pass, 'vision_matmul_q8_sgmat',
+          [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
+          [mm0Act, vw.get('mm2WQ')!, vw.get('mm2WS')!, vw.get('mm2Bias')!],
+          [imageEmbedsBuf, dummy1, dummy2])
+        pass.dispatchWorkgroups(Math.ceil(projDim / sgWG_N), Math.ceil(numMerged / sgWG_M))
+      } else if (hasQ8 && vw.get('mm2WQ')) {
         setup(pass, 'vision_matmul_q8_tiled',
           [['u', numMerged], ['u', projDim], ['u', mergedDim], ['u', projDim], ['u', 0], ['u', 0], ['u', 1]],
           [mm0Act, vw.get('mm2WQ')!, vw.get('mm2WS')!, vw.get('mm2Bias')!],
