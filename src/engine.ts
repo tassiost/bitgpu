@@ -557,6 +557,106 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     CD = GPUBufferUsage.COPY_DST,
     CS = GPUBufferUsage.COPY_SRC,
     U = GPUBufferUsage.UNIFORM
+
+  // Preload vision weights in parallel with the rest of engine init.
+  // This overlaps the ~3s HTTP fetch + CPU repacking with LLM model loading,
+  // so the first visionForward call doesn't pay the full weight loading cost.
+  if (visionState && opts.visionMmprojUrl && !visionState.loaded && !visionState.loading) {
+    const mmprojUrl = opts.visionMmprojUrl
+    visionState.loading = loadVisionWeights(mmprojUrl).then(({ weights, config }) => {
+      visionState!.weights = weights
+      visionState!.config = config
+      visionState!.loaded = true
+      visionState!.loading = null
+      // Upload all vision weights to GPU buffers
+      const vw = weights!
+      const up = (data: Float32Array): GPUBuffer => {
+        const b = device.createBuffer({ size: data.byteLength, usage: S_ | CD | CS })
+        device.queue.writeBuffer(b, 0, data.buffer, data.byteOffset, data.byteLength)
+        return b
+      }
+      const upQ8 = (pw: { packed: Uint32Array, scales: Float32Array }): { packed: GPUBuffer, scales: GPUBuffer } => {
+        const pBuf = device.createBuffer({ size: pw.packed.byteLength, usage: S_ | CD | CS })
+        device.queue.writeBuffer(pBuf, 0, pw.packed.buffer, pw.packed.byteOffset, pw.packed.byteLength)
+        const sBuf = device.createBuffer({ size: pw.scales.byteLength, usage: S_ | CD | CS })
+        device.queue.writeBuffer(sBuf, 0, pw.scales.buffer, pw.scales.byteOffset, pw.scales.byteLength)
+        return { packed: pBuf, scales: sBuf }
+      }
+      const upF16 = (pw: { data: Uint16Array }): GPUBuffer => {
+        const b = device.createBuffer({ size: pw.data.byteLength, usage: S_ | CD | CS })
+        device.queue.writeBuffer(b, 0, pw.data.buffer, pw.data.byteOffset, pw.data.byteLength)
+        return b
+      }
+      const vb = visionState!.buffers
+      vb.set('patchEmbdWeight', up(vw.patchEmbdWeight))
+      vb.set('patchEmbdWeightCompact', up(vw.patchEmbdWeightCompact))
+      vb.set('patchEmbdBias', up(vw.patchEmbdBias))
+      vb.set('positionEmbd', up(vw.positionEmbd))
+      vb.set('postLnWeight', up(vw.postLnWeight))
+      vb.set('postLnBias', up(vw.postLnBias))
+      if (vw.q8?.mergerMm0) {
+        const mm0Q8 = upQ8(vw.q8.mergerMm0)
+        vb.set('mm0WQ', mm0Q8.packed)
+        vb.set('mm0WS', mm0Q8.scales)
+      } else {
+        vb.set('mm0Weight', up(vw.mergerMm0Weight))
+      }
+      if (vw.q8?.mergerMm2) {
+        const mm2Q8 = upQ8(vw.q8.mergerMm2)
+        vb.set('mm2WQ', mm2Q8.packed)
+        vb.set('mm2WS', mm2Q8.scales)
+      } else {
+        vb.set('mm2Weight', up(vw.mergerMm2Weight))
+      }
+      vb.set('mm0Bias', up(vw.mergerMm0Bias))
+      vb.set('mm2Bias', up(vw.mergerMm2Bias))
+      for (let li = 0; li < vw.layers.length; li++) {
+        const lw = vw.layers[li]
+        const p = `l${li}.`
+        vb.set(p + 'ln1W', up(lw.ln1Weight))
+        vb.set(p + 'ln1B', up(lw.ln1Bias))
+        if (vw.q8) {
+          const ql = vw.q8.layers[li]
+          const qkvQ8 = upQ8(ql.qkv)
+          vb.set(p + 'qkvWQ', qkvQ8.packed)
+          vb.set(p + 'qkvWS', qkvQ8.scales)
+          const attnQ8 = upQ8(ql.attnOut)
+          vb.set(p + 'attnOutWQ', attnQ8.packed)
+          vb.set(p + 'attnOutWS', attnQ8.scales)
+          const ffnUpQ8 = upQ8(ql.ffnUp)
+          vb.set(p + 'ffnUpWQ', ffnUpQ8.packed)
+          vb.set(p + 'ffnUpWS', ffnUpQ8.scales)
+        } else {
+          vb.set(p + 'qkvW', up(lw.qkvWeight))
+          vb.set(p + 'attnOutW', up(lw.attnOutWeight))
+          vb.set(p + 'ffnUpW', up(lw.ffnUpWeight))
+        }
+        vb.set(p + 'qkvB', up(lw.qkvBias))
+        vb.set(p + 'attnOutB', up(lw.attnOutBias))
+        vb.set(p + 'ln2W', up(lw.ln2Weight))
+        vb.set(p + 'ln2B', up(lw.ln2Bias))
+        vb.set(p + 'ffnUpB', up(lw.ffnUpBias))
+        if (vw.f16 && vw.f16.layers[li]?.ffnDown) {
+          vb.set(p + 'ffnDownWF16', upF16(vw.f16.layers[li].ffnDown))
+        } else {
+          vb.set(p + 'ffnDownW', up(lw.ffnDownWeight))
+        }
+        vb.set(p + 'ffnDownB', up(lw.ffnDownBias))
+      }
+      if (vw.q8) {
+        if (vw.q8.mergerMm0) {
+          const mm0Q8 = upQ8(vw.q8.mergerMm0)
+          vb.set('mm0WQ', mm0Q8.packed)
+          vb.set('mm0WS', mm0Q8.scales)
+        }
+        if (vw.q8.mergerMm2) {
+          const mm2Q8 = upQ8(vw.q8.mergerMm2)
+          vb.set('mm2WQ', mm2Q8.packed)
+          vb.set('mm2WS', mm2Q8.scales)
+        }
+      }
+    })
+  }
   // Per-call transient tracking: generate/prefill/forward set `transients = []` so every scratch
   // buffer they create (activations, per-dispatch uniforms, prompt embeddings) is destroyed as soon
   // as its submission completes, instead of lingering until GC. A long prefill otherwise holds
@@ -3382,119 +3482,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (!visionState || !visionCfg) {
       throw new Error('visionForward: this model has no vision tower (arch.vision is undefined)')
     }
-    // Load the mmproj pack lazily on first call
-    if (!visionState.loaded && !visionState.loading) {
-      const mmprojUrl = opts.visionMmprojUrl
-      if (!mmprojUrl) {
-        throw new Error('visionForward: visionMmprojUrl not set — cannot load vision weights')
-      }
-      visionState.loading = loadVisionWeights(mmprojUrl).then(({ weights, config }) => {
-        visionState!.weights = weights
-        visionState!.config = config
-        visionState!.loaded = true
-        visionState!.loading = null
-        // Upload all vision weights to GPU buffers
-        const vw = weights!
-        const up = (data: Float32Array): GPUBuffer => {
-          const b = device.createBuffer({ size: data.byteLength, usage: S_ | CD | CS })
-          device.queue.writeBuffer(b, 0, data.buffer, data.byteOffset, data.byteLength)
-          return b
-        }
-        // Upload packed Q8 weight (two buffers: packed u32 words + f32 scales)
-        const upQ8 = (pw: { packed: Uint32Array, scales: Float32Array }): { packed: GPUBuffer, scales: GPUBuffer } => {
-          const pBuf = device.createBuffer({ size: pw.packed.byteLength, usage: S_ | CD | CS })
-          device.queue.writeBuffer(pBuf, 0, pw.packed.buffer, pw.packed.byteOffset, pw.packed.byteLength)
-          const sBuf = device.createBuffer({ size: pw.scales.byteLength, usage: S_ | CD | CS })
-          device.queue.writeBuffer(sBuf, 0, pw.scales.buffer, pw.scales.byteOffset, pw.scales.byteLength)
-          return { packed: pBuf, scales: sBuf }
-        }
-        // Upload f16 weight (raw Uint16Array bytes)
-        const upF16 = (pw: { data: Uint16Array }): GPUBuffer => {
-          const b = device.createBuffer({ size: pw.data.byteLength, usage: S_ | CD | CS })
-          device.queue.writeBuffer(b, 0, pw.data.buffer, pw.data.byteOffset, pw.data.byteLength)
-          return b
-        }
-        const vb = visionState!.buffers
-        vb.set('patchEmbdWeight', up(vw.patchEmbdWeight))
-        vb.set('patchEmbdWeightCompact', up(vw.patchEmbdWeightCompact))
-        vb.set('patchEmbdBias', up(vw.patchEmbdBias))
-        vb.set('positionEmbd', up(vw.positionEmbd))
-        vb.set('postLnWeight', up(vw.postLnWeight))
-        vb.set('postLnBias', up(vw.postLnBias))
-        // Merger weights: upload Q8 if available, else f32
-        if (vw.q8?.mergerMm0) {
-          const mm0Q8 = upQ8(vw.q8.mergerMm0)
-          vb.set('mm0WQ', mm0Q8.packed)
-          vb.set('mm0WS', mm0Q8.scales)
-        } else {
-          vb.set('mm0Weight', up(vw.mergerMm0Weight))
-        }
-        if (vw.q8?.mergerMm2) {
-          const mm2Q8 = upQ8(vw.q8.mergerMm2)
-          vb.set('mm2WQ', mm2Q8.packed)
-          vb.set('mm2WS', mm2Q8.scales)
-        } else {
-          vb.set('mm2Weight', up(vw.mergerMm2Weight))
-        }
-        vb.set('mm0Bias', up(vw.mergerMm0Bias))
-        vb.set('mm2Bias', up(vw.mergerMm2Bias))
-        for (let li = 0; li < vw.layers.length; li++) {
-          const lw = vw.layers[li]
-          const p = `l${li}.`
-          vb.set(p + 'ln1W', up(lw.ln1Weight))
-          vb.set(p + 'ln1B', up(lw.ln1Bias))
-          // Q8_0 weights: upload packed Q8 only (skip f32 to save VRAM + upload time)
-          // ffn_down is F16 (not Q8_0), so always upload as f32
-          if (vw.q8) {
-            const ql = vw.q8.layers[li]
-            const qkvQ8 = upQ8(ql.qkv)
-            vb.set(p + 'qkvWQ', qkvQ8.packed)
-            vb.set(p + 'qkvWS', qkvQ8.scales)
-            const attnQ8 = upQ8(ql.attnOut)
-            vb.set(p + 'attnOutWQ', attnQ8.packed)
-            vb.set(p + 'attnOutWS', attnQ8.scales)
-            const ffnUpQ8 = upQ8(ql.ffnUp)
-            vb.set(p + 'ffnUpWQ', ffnUpQ8.packed)
-            vb.set(p + 'ffnUpWS', ffnUpQ8.scales)
-          } else {
-            // No Q8 — upload f32 weights
-            vb.set(p + 'qkvW', up(lw.qkvWeight))
-            vb.set(p + 'attnOutW', up(lw.attnOutWeight))
-            vb.set(p + 'ffnUpW', up(lw.ffnUpWeight))
-          }
-          vb.set(p + 'qkvB', up(lw.qkvBias))
-          vb.set(p + 'attnOutB', up(lw.attnOutBias))
-          vb.set(p + 'ln2W', up(lw.ln2Weight))
-          vb.set(p + 'ln2B', up(lw.ln2Bias))
-          vb.set(p + 'ffnUpB', up(lw.ffnUpBias))
-          // FFN down: upload as f16 if available, else f32
-          if (vw.f16 && vw.f16.layers[li]?.ffnDown) {
-            vb.set(p + 'ffnDownWF16', upF16(vw.f16.layers[li].ffnDown))
-          } else {
-            vb.set(p + 'ffnDownW', up(lw.ffnDownWeight))
-          }
-          vb.set(p + 'ffnDownB', up(lw.ffnDownBias))
-        }
-        // Upload merger Q8 weights
-        if (vw.q8) {
-          if (vw.q8.mergerMm0) {
-            const mm0Q8 = upQ8(vw.q8.mergerMm0)
-            vb.set('mm0WQ', mm0Q8.packed)
-            vb.set('mm0WS', mm0Q8.scales)
-          }
-          if (vw.q8.mergerMm2) {
-            const mm2Q8 = upQ8(vw.q8.mergerMm2)
-            vb.set('mm2WQ', mm2Q8.packed)
-            vb.set('mm2WS', mm2Q8.scales)
-          }
-        }
-      })
-    }
+    // Vision weights are preloaded during engine init (overlapped with LLM model loading).
+    // Just await the loading promise if it's still in progress.
     if (visionState.loading) {
       await visionState.loading
     }
     if (!visionState.weights || !visionState.buffers.size) {
-      throw new Error('visionForward: weights failed to load')
+      throw new Error('visionForward: weights failed to load (preload may have failed)')
     }
 
     const t0 = performance.now()
