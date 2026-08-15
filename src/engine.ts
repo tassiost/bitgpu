@@ -3396,10 +3396,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         // Upload all vision weights to GPU buffers
         const vw = weights!
         const up = (data: Float32Array): GPUBuffer => {
-          // Copy into a fresh ArrayBuffer to avoid byteOffset/view issues
-          const copy = new Float32Array(data)
-          const b = device.createBuffer({ size: copy.byteLength, usage: S_ | CD | CS })
-          device.queue.writeBuffer(b, 0, copy.buffer, 0, copy.byteLength)
+          const b = device.createBuffer({ size: data.byteLength, usage: S_ | CD | CS })
+          device.queue.writeBuffer(b, 0, data.buffer, data.byteOffset, data.byteLength)
           return b
         }
         // Upload packed Q8 weight (two buffers: packed u32 words + f32 scales)
