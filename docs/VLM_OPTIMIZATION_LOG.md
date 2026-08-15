@@ -883,3 +883,56 @@ Researched latest WebGPU VLM optimization techniques. Key findings:
    batching all 27 layers into one compute pass.
 6. **Packed 4x8 integer dot product**: Available in Chrome 123+. 1.6-2.9× faster
    than f16 for 8-bit data. Could help Q8 dequantization.
+
+### Shader micro-optimization experiments (2025-01-24)
+
+Tested several compute loop variants for the 2D tiled Q8 matmul shaders.
+All measured on 234-patch screenshot benchmark (27 layers, 936 patches).
+
+**Baseline**: 2D tiled Q8 with manual FMA unrolling, BM=64, BN=64, BKV=8, 256 threads
+- Performance: ~3295ms avg (includes ~3000ms weight loading on first call)
+- GPU-only time: ~2400ms for 27 layers = 89ms/layer
+- Compute throughput: ~160 GFLOPS (3.2% of M2 ~5 TFLOPS peak)
+
+**Experiments (all REVERTED)**:
+
+1. **2× K unrolling** (process 2 kv values per iteration for ILP):
+   - Result: 37% slower (3628ms vs 2647ms for 4-patch test)
+   - Cause: Register pressure spilling — 32 accumulators + 16 X + 16 W = 64 extra registers
+
+2. **F16 shared memory** (store xs/ws as vec4<f16> instead of vec4<f32>):
+   - Shared memory: 16KB → 8KB (allows 4 WGs/core instead of 2)
+   - Result: 60% slower (5289ms avg vs 3295ms avg)
+   - Cause: f16→f32 conversion overhead in compute loop negates occupancy gain
+
+3. **1D tiled shaders** (4KB shared memory, 8 WGs/core, but W re-read per M row):
+   - Result: 9× slower for 234 patches (29913ms vs 3295ms)
+   - Cause: W is re-read 936× per layer (M=936 rows), overwhelming the bandwidth savings
+   - Note: 1D shaders are better for small M (4 patches: 28% slower, not 9×)
+
+4. **F16 accumulators** (var acc: array<f16, 16> for 2× FP16 compute throughput):
+   - Result: 32% slower (4401ms min vs 3332ms min)
+   - Cause: Metal compiler doesn't generate efficient f16 FMA from WGSL —
+     the f16→f32 conversions for shared memory loads add overhead
+
+5. **dot() built-in** (replace manual FMA with dot(vec4, vec4)):
+   - Result: 96% slower (6449ms avg vs 3295ms avg)
+   - Cause: WGSL→Metal compiler generates worse code for dot() than manual FMA.
+     Manual FMA with explicit component access produces better instruction scheduling.
+
+**Key learnings**:
+- The WGSL→Metal compiler is sensitive to code structure. Manual FMA unrolling
+  with explicit component access (xr0.x*w0.x + xr0.y*w0.y + ...) generates
+  significantly better code than dot() or f16 arithmetic.
+- Shared memory type matters more than occupancy. f32 shared memory with 2 WGs/core
+  is faster than f16 shared memory with 4 WGs/core due to conversion overhead.
+- Register pressure is the limiting factor for unrolling. 16 accumulators + 8 X + 8 W
+  = 32 values per iteration is near the register limit for 256 threads.
+- 2D tiling is essential for large M. The W re-read in 1D tiling dominates for M > 100.
+
+### f16 LUT for weight loading (2025-01-24)
+
+Replaced bit-level f16→f32 conversion with a 65536-entry lookup table in repackQ8_0.
+- Engine creation: ~28s → ~25s (11% faster weight loading)
+- GPU compute: unchanged (LUT only affects CPU-side repacking)
+- The LUT is pre-computed at module load time and covers all 65536 possible f16 bit patterns.
