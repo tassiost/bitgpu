@@ -763,17 +763,42 @@ committed state.
 - F16 tiled add (FFN down): BKV=4, both X+W in shared (8KB)
 
 **GPU forward pass profiling** (via timestamp-query):
-- GPU time (27 layers): ~1360ms (actual on-GPU time)
+- GPU time (27 layers): ~1360ms (actual on-GPU time, pre-BKV=8)
 - CPU wall-clock: ~1420ms (60ms submit/queue overhead)
 - Per-layer: ~50.4ms
 - Weight loading: ~1657ms (4 parallel chunks)
-- Total vision tower: ~3020ms
+- Total vision tower: ~3020ms (pre-BKV=8), ~3000ms (post-BKV=8)
 
-The GPU time of 1360ms is 22.5× slower than the compute roofline (60.3ms).
+The GPU time is 22.5× slower than the compute roofline (60.3ms).
 The gap is due to Q8 dequantization overhead (~4.5 instructions per FMA),
-shared memory barriers (144 per dispatch for QKV), and low occupancy
-(8KB shared = 2 WGs/core at 16KB limit).
+shared memory barriers, and low occupancy.
 
 **8-chunk parallel fetch**: Tested and reverted. 8 chunks was slower than 4
 (2317ms vs 1657ms weight loading) due to connection contention. 4 chunks
 is the sweet spot for localhost.
+
+### 2026-08-16: Manual loop unrolling + BKV=8 (COMMITTED)
+
+**Manual loop unrolling** (nuss-and-bolts study):
+- Researched WebGPU matmul optimization techniques. Key finding: the WGSL→Metal
+  compiler doesn't always unroll loops even with known bounds. Manual unrolling
+  of the inner tm/tn loops (4×4 register tile) gave ~3x on Apple Silicon in the
+  nuss-and-bolts study.
+- Applied manual unrolling to all 4 tiled matmul shaders (bias init, compute
+  loop, output write). Result: avg 4877ms → 4292ms (12% better), accuracy
+  preserved. Min unchanged (within noise).
+
+**BKV=8 (full Q8_0 block processing)**:
+- Changed BKV from 4 to 8 in all 4 tiled matmul shaders. This processes a full
+  Q8_0 block (32 elements) per K iteration, halving the number of barriers and
+  shared memory load overhead. Shared memory doubles from 8KB to 16KB (1 WG/core
+  at limit), but the reduced barrier overhead more than compensates.
+- Result: avg 4292ms → 3502ms (18% faster), min 3727ms → 3261ms (12.5% faster).
+  Accuracy preserved across all 3 runs.
+
+**BKV=16**: Tested and failed. 32KB shared memory exceeds WebGPU limits.
+
+**unpack4x8snorm dequantization**: Tested and reverted. Using the builtin
+`unpack4x8snorm(packed) * (scale * 127.0)` instead of manual sign-extension
+was significantly slower (avg 5278ms vs 3502ms). The builtin appears to be
+less efficient than manual bit manipulation on Apple Silicon's Metal backend.
