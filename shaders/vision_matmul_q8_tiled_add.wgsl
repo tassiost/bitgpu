@@ -3,6 +3,7 @@
 //
 // Same as vision_matmul_q8_tiled but with fused residual add.
 // Single output only (N1=N2=0).
+// Inner compute loops manually unrolled for Apple Silicon.
 const BM: u32 = 64u;
 const BN: u32 = 64u;
 const BKV: u32 = 4u;
@@ -35,12 +36,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   let tc = (tid % 16u) * 4u;
   let Kv = p.K / 4u;
 
+  // Initialize accumulator with bias (unrolled)
   var acc: array<f32, 16>;
-  for (var i = 0u; i < 16u; i = i + 1u) {
-    let tn = i % 4u;
-    let gn = tileN + tc + tn;
-    acc[i] = select(0.0, bias[gn], p.hasBias != 0u && gn < p.N);
-  }
+  acc[ 0] = select(0.0, bias[tileN + tc + 0u], p.hasBias != 0u && tileN + tc + 0u < p.N);
+  acc[ 1] = select(0.0, bias[tileN + tc + 1u], p.hasBias != 0u && tileN + tc + 1u < p.N);
+  acc[ 2] = select(0.0, bias[tileN + tc + 2u], p.hasBias != 0u && tileN + tc + 2u < p.N);
+  acc[ 3] = select(0.0, bias[tileN + tc + 3u], p.hasBias != 0u && tileN + tc + 3u < p.N);
+  acc[ 4] = acc[ 0]; acc[ 5] = acc[ 1]; acc[ 6] = acc[ 2]; acc[ 7] = acc[ 3];
+  acc[ 8] = acc[ 0]; acc[ 9] = acc[ 1]; acc[10] = acc[ 2]; acc[11] = acc[ 3];
+  acc[12] = acc[ 0]; acc[13] = acc[ 1]; acc[14] = acc[ 2]; acc[15] = acc[ 3];
 
   let Ksteps = Kv / BKV;
   for (var ks = 0u; ks < Ksteps; ks = ks + 1u) {
@@ -66,25 +70,71 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
       ws[e] = wv;
     }
     workgroupBarrier();
+    // Compute 4x4 register tile — manually unrolled
     for (var kv = 0u; kv < BKV; kv = kv + 1u) {
-      var xr: array<vec4<f32>, 4>;
-      for (var tm = 0u; tm < 4u; tm = tm + 1u) { xr[tm] = xs[(tr + tm) * BKV + kv]; }
-      for (var tn = 0u; tn < 4u; tn = tn + 1u) {
-        let w = ws[(tc + tn) * BKV + kv];
-        for (var tm = 0u; tm < 4u; tm = tm + 1u) { acc[tm * 4u + tn] = acc[tm * 4u + tn] + dot(xr[tm], w); }
-      }
+      let xr0 = xs[(tr + 0u) * BKV + kv];
+      let xr1 = xs[(tr + 1u) * BKV + kv];
+      let xr2 = xs[(tr + 2u) * BKV + kv];
+      let xr3 = xs[(tr + 3u) * BKV + kv];
+      let w0 = ws[(tc + 0u) * BKV + kv];
+      let w1 = ws[(tc + 1u) * BKV + kv];
+      let w2 = ws[(tc + 2u) * BKV + kv];
+      let w3 = ws[(tc + 3u) * BKV + kv];
+      acc[ 0] = acc[ 0] + dot(xr0, w0);
+      acc[ 1] = acc[ 1] + dot(xr0, w1);
+      acc[ 2] = acc[ 2] + dot(xr0, w2);
+      acc[ 3] = acc[ 3] + dot(xr0, w3);
+      acc[ 4] = acc[ 4] + dot(xr1, w0);
+      acc[ 5] = acc[ 5] + dot(xr1, w1);
+      acc[ 6] = acc[ 6] + dot(xr1, w2);
+      acc[ 7] = acc[ 7] + dot(xr1, w3);
+      acc[ 8] = acc[ 8] + dot(xr2, w0);
+      acc[ 9] = acc[ 9] + dot(xr2, w1);
+      acc[10] = acc[10] + dot(xr2, w2);
+      acc[11] = acc[11] + dot(xr2, w3);
+      acc[12] = acc[12] + dot(xr3, w0);
+      acc[13] = acc[13] + dot(xr3, w1);
+      acc[14] = acc[14] + dot(xr3, w2);
+      acc[15] = acc[15] + dot(xr3, w3);
     }
     workgroupBarrier();
   }
 
-  // Write output with fused residual add
-  for (var tm = 0u; tm < 4u; tm = tm + 1u) {
-    let gm = tileM + tr + tm;
-    if (gm >= p.M) { continue; }
-    for (var tn = 0u; tn < 4u; tn = tn + 1u) {
-      let gn = tileN + tc + tn;
-      if (gn >= p.N) { continue; }
-      out[gm * p.N + gn] = residual[gm * p.N + gn] + acc[tm * 4u + tn];
+  // Write output with fused residual add (unrolled)
+  {
+    let gm = tileM + tr + 0u;
+    if (gm < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < p.N) { out[gm * p.N + gn0] = residual[gm * p.N + gn0] + acc[ 0]; }
+      let gn1 = tileN + tc + 1u; if (gn1 < p.N) { out[gm * p.N + gn1] = residual[gm * p.N + gn1] + acc[ 1]; }
+      let gn2 = tileN + tc + 2u; if (gn2 < p.N) { out[gm * p.N + gn2] = residual[gm * p.N + gn2] + acc[ 2]; }
+      let gn3 = tileN + tc + 3u; if (gn3 < p.N) { out[gm * p.N + gn3] = residual[gm * p.N + gn3] + acc[ 3]; }
+    }
+  }
+  {
+    let gm = tileM + tr + 1u;
+    if (gm < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < p.N) { out[gm * p.N + gn0] = residual[gm * p.N + gn0] + acc[ 4]; }
+      let gn1 = tileN + tc + 1u; if (gn1 < p.N) { out[gm * p.N + gn1] = residual[gm * p.N + gn1] + acc[ 5]; }
+      let gn2 = tileN + tc + 2u; if (gn2 < p.N) { out[gm * p.N + gn2] = residual[gm * p.N + gn2] + acc[ 6]; }
+      let gn3 = tileN + tc + 3u; if (gn3 < p.N) { out[gm * p.N + gn3] = residual[gm * p.N + gn3] + acc[ 7]; }
+    }
+  }
+  {
+    let gm = tileM + tr + 2u;
+    if (gm < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < p.N) { out[gm * p.N + gn0] = residual[gm * p.N + gn0] + acc[ 8]; }
+      let gn1 = tileN + tc + 1u; if (gn1 < p.N) { out[gm * p.N + gn1] = residual[gm * p.N + gn1] + acc[ 9]; }
+      let gn2 = tileN + tc + 2u; if (gn2 < p.N) { out[gm * p.N + gn2] = residual[gm * p.N + gn2] + acc[10]; }
+      let gn3 = tileN + tc + 3u; if (gn3 < p.N) { out[gm * p.N + gn3] = residual[gm * p.N + gn3] + acc[11]; }
+    }
+  }
+  {
+    let gm = tileM + tr + 3u;
+    if (gm < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < p.N) { out[gm * p.N + gn0] = residual[gm * p.N + gn0] + acc[12]; }
+      let gn1 = tileN + tc + 1u; if (gn1 < p.N) { out[gm * p.N + gn1] = residual[gm * p.N + gn1] + acc[13]; }
+      let gn2 = tileN + tc + 2u; if (gn2 < p.N) { out[gm * p.N + gn2] = residual[gm * p.N + gn2] + acc[14]; }
+      let gn3 = tileN + tc + 3u; if (gn3 < p.N) { out[gm * p.N + gn3] = residual[gm * p.N + gn3] + acc[15]; }
     }
   }
 }

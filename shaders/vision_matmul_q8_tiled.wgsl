@@ -10,8 +10,11 @@
 //   value = f32(int8(byte)) * block_scale
 // Then stored as vec4<f32> in shared memory for the dot product loop.
 //
+// Inner compute loops are MANUALLY UNROLLED — the WGSL→Metal compiler
+// doesn't always unroll even with known bounds (nuss-and-bolts study
+// showed ~3x from manual unrolling on Apple Silicon).
+//
 // Supports split outputs (QKV): routes output columns to out0/out1/out2.
-// Pattern follows matmul_split_tiled.wgsl from the LLM engine.
 struct Params {
   M: u32,        // number of input rows (num_patches)
   N: u32,        // total output features
@@ -48,13 +51,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   let tc = (tid % 16u) * 4u;  // Thread col in 4x4 tile
   let Kv = p.K / 4u;          // K in vec4 units
 
-  // Initialize accumulator with bias
+  // Initialize accumulator with bias (unrolled)
   var acc: array<f32, 16>;
-  for (var i = 0u; i < 16u; i = i + 1u) {
-    let tn = i % 4u;
-    let gn = tileN + tc + tn;
-    acc[i] = select(0.0, bias[gn], p.hasBias != 0u && gn < Ntot);
-  }
+  acc[ 0] = select(0.0, bias[tileN + tc + 0u], p.hasBias != 0u && tileN + tc + 0u < Ntot);
+  acc[ 1] = select(0.0, bias[tileN + tc + 1u], p.hasBias != 0u && tileN + tc + 1u < Ntot);
+  acc[ 2] = select(0.0, bias[tileN + tc + 2u], p.hasBias != 0u && tileN + tc + 2u < Ntot);
+  acc[ 3] = select(0.0, bias[tileN + tc + 3u], p.hasBias != 0u && tileN + tc + 3u < Ntot);
+  acc[ 4] = acc[ 0]; acc[ 5] = acc[ 1]; acc[ 6] = acc[ 2]; acc[ 7] = acc[ 3];
+  acc[ 8] = acc[ 0]; acc[ 9] = acc[ 1]; acc[10] = acc[ 2]; acc[11] = acc[ 3];
+  acc[12] = acc[ 0]; acc[13] = acc[ 1]; acc[14] = acc[ 2]; acc[15] = acc[ 3];
 
   let Ksteps = Kv / BKV;
   for (var ks = 0u; ks < Ksteps; ks = ks + 1u) {
@@ -99,38 +104,73 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
     workgroupBarrier();
 
-    // Compute 4x4 register tile
+    // Compute 4x4 register tile — manually unrolled tm/tn loops
+    // (WGSL→Metal compiler doesn't always unroll even with known bounds)
     for (var kv = 0u; kv < BKV; kv = kv + 1u) {
-      var xr: array<vec4<f32>, 4>;
-      for (var tm = 0u; tm < 4u; tm = tm + 1u) {
-        xr[tm] = xs[(tr + tm) * BKV + kv];
-      }
-      for (var tn = 0u; tn < 4u; tn = tn + 1u) {
-        let w = ws[(tc + tn) * BKV + kv];
-        for (var tm = 0u; tm < 4u; tm = tm + 1u) {
-          acc[tm * 4u + tn] = acc[tm * 4u + tn] + dot(xr[tm], w);
-        }
-      }
+      let xr0 = xs[(tr + 0u) * BKV + kv];
+      let xr1 = xs[(tr + 1u) * BKV + kv];
+      let xr2 = xs[(tr + 2u) * BKV + kv];
+      let xr3 = xs[(tr + 3u) * BKV + kv];
+      let w0 = ws[(tc + 0u) * BKV + kv];
+      let w1 = ws[(tc + 1u) * BKV + kv];
+      let w2 = ws[(tc + 2u) * BKV + kv];
+      let w3 = ws[(tc + 3u) * BKV + kv];
+      acc[ 0] = acc[ 0] + dot(xr0, w0);
+      acc[ 1] = acc[ 1] + dot(xr0, w1);
+      acc[ 2] = acc[ 2] + dot(xr0, w2);
+      acc[ 3] = acc[ 3] + dot(xr0, w3);
+      acc[ 4] = acc[ 4] + dot(xr1, w0);
+      acc[ 5] = acc[ 5] + dot(xr1, w1);
+      acc[ 6] = acc[ 6] + dot(xr1, w2);
+      acc[ 7] = acc[ 7] + dot(xr1, w3);
+      acc[ 8] = acc[ 8] + dot(xr2, w0);
+      acc[ 9] = acc[ 9] + dot(xr2, w1);
+      acc[10] = acc[10] + dot(xr2, w2);
+      acc[11] = acc[11] + dot(xr2, w3);
+      acc[12] = acc[12] + dot(xr3, w0);
+      acc[13] = acc[13] + dot(xr3, w1);
+      acc[14] = acc[14] + dot(xr3, w2);
+      acc[15] = acc[15] + dot(xr3, w3);
     }
 
     workgroupBarrier();
   }
 
-  // Write output with split routing
-  for (var tm = 0u; tm < 4u; tm = tm + 1u) {
-    let gm = tileM + tr + tm;
-    if (gm >= p.M) { continue; }
-    for (var tn = 0u; tn < 4u; tn = tn + 1u) {
-      let gn = tileN + tc + tn;
-      if (gn >= Ntot) { continue; }
-      let v = acc[tm * 4u + tn];
-      if (gn < p.N0) {
-        out0[gm * p.N0 + gn] = v;
-      } else if (gn < p.N0 + p.N1) {
-        out1[gm * p.N1 + (gn - p.N0)] = v;
-      } else {
-        out2[gm * p.N2 + (gn - p.N0 - p.N1)] = v;
-      }
+  // Write output with split routing (unrolled)
+  {
+    let gm0 = tileM + tr + 0u;
+    if (gm0 < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < Ntot) { let v = acc[ 0]; if (gn0 < p.N0) { out0[gm0 * p.N0 + gn0] = v; } else if (gn0 < p.N0 + p.N1) { out1[gm0 * p.N1 + (gn0 - p.N0)] = v; } else { out2[gm0 * p.N2 + (gn0 - p.N0 - p.N1)] = v; } }
+      let gn1 = tileN + tc + 1u; if (gn1 < Ntot) { let v = acc[ 1]; if (gn1 < p.N0) { out0[gm0 * p.N0 + gn1] = v; } else if (gn1 < p.N0 + p.N1) { out1[gm0 * p.N1 + (gn1 - p.N0)] = v; } else { out2[gm0 * p.N2 + (gn1 - p.N0 - p.N1)] = v; } }
+      let gn2 = tileN + tc + 2u; if (gn2 < Ntot) { let v = acc[ 2]; if (gn2 < p.N0) { out0[gm0 * p.N0 + gn2] = v; } else if (gn2 < p.N0 + p.N1) { out1[gm0 * p.N1 + (gn2 - p.N0)] = v; } else { out2[gm0 * p.N2 + (gn2 - p.N0 - p.N1)] = v; } }
+      let gn3 = tileN + tc + 3u; if (gn3 < Ntot) { let v = acc[ 3]; if (gn3 < p.N0) { out0[gm0 * p.N0 + gn3] = v; } else if (gn3 < p.N0 + p.N1) { out1[gm0 * p.N1 + (gn3 - p.N0)] = v; } else { out2[gm0 * p.N2 + (gn3 - p.N0 - p.N1)] = v; } }
+    }
+  }
+  {
+    let gm1 = tileM + tr + 1u;
+    if (gm1 < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < Ntot) { let v = acc[ 4]; if (gn0 < p.N0) { out0[gm1 * p.N0 + gn0] = v; } else if (gn0 < p.N0 + p.N1) { out1[gm1 * p.N1 + (gn0 - p.N0)] = v; } else { out2[gm1 * p.N2 + (gn0 - p.N0 - p.N1)] = v; } }
+      let gn1 = tileN + tc + 1u; if (gn1 < Ntot) { let v = acc[ 5]; if (gn1 < p.N0) { out0[gm1 * p.N0 + gn1] = v; } else if (gn1 < p.N0 + p.N1) { out1[gm1 * p.N1 + (gn1 - p.N0)] = v; } else { out2[gm1 * p.N2 + (gn1 - p.N0 - p.N1)] = v; } }
+      let gn2 = tileN + tc + 2u; if (gn2 < Ntot) { let v = acc[ 6]; if (gn2 < p.N0) { out0[gm1 * p.N0 + gn2] = v; } else if (gn2 < p.N0 + p.N1) { out1[gm1 * p.N1 + (gn2 - p.N0)] = v; } else { out2[gm1 * p.N2 + (gn2 - p.N0 - p.N1)] = v; } }
+      let gn3 = tileN + tc + 3u; if (gn3 < Ntot) { let v = acc[ 7]; if (gn3 < p.N0) { out0[gm1 * p.N0 + gn3] = v; } else if (gn3 < p.N0 + p.N1) { out1[gm1 * p.N1 + (gn3 - p.N0)] = v; } else { out2[gm1 * p.N2 + (gn3 - p.N0 - p.N1)] = v; } }
+    }
+  }
+  {
+    let gm2 = tileM + tr + 2u;
+    if (gm2 < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < Ntot) { let v = acc[ 8]; if (gn0 < p.N0) { out0[gm2 * p.N0 + gn0] = v; } else if (gn0 < p.N0 + p.N1) { out1[gm2 * p.N1 + (gn0 - p.N0)] = v; } else { out2[gm2 * p.N2 + (gn0 - p.N0 - p.N1)] = v; } }
+      let gn1 = tileN + tc + 1u; if (gn1 < Ntot) { let v = acc[ 9]; if (gn1 < p.N0) { out0[gm2 * p.N0 + gn1] = v; } else if (gn1 < p.N0 + p.N1) { out1[gm2 * p.N1 + (gn1 - p.N0)] = v; } else { out2[gm2 * p.N2 + (gn1 - p.N0 - p.N1)] = v; } }
+      let gn2 = tileN + tc + 2u; if (gn2 < Ntot) { let v = acc[10]; if (gn2 < p.N0) { out0[gm2 * p.N0 + gn2] = v; } else if (gn2 < p.N0 + p.N1) { out1[gm2 * p.N1 + (gn2 - p.N0)] = v; } else { out2[gm2 * p.N2 + (gn2 - p.N0 - p.N1)] = v; } }
+      let gn3 = tileN + tc + 3u; if (gn3 < Ntot) { let v = acc[11]; if (gn3 < p.N0) { out0[gm2 * p.N0 + gn3] = v; } else if (gn3 < p.N0 + p.N1) { out1[gm2 * p.N1 + (gn3 - p.N0)] = v; } else { out2[gm2 * p.N2 + (gn3 - p.N0 - p.N1)] = v; } }
+    }
+  }
+  {
+    let gm3 = tileM + tr + 3u;
+    if (gm3 < p.M) {
+      let gn0 = tileN + tc + 0u; if (gn0 < Ntot) { let v = acc[12]; if (gn0 < p.N0) { out0[gm3 * p.N0 + gn0] = v; } else if (gn0 < p.N0 + p.N1) { out1[gm3 * p.N1 + (gn0 - p.N0)] = v; } else { out2[gm3 * p.N2 + (gn0 - p.N0 - p.N1)] = v; } }
+      let gn1 = tileN + tc + 1u; if (gn1 < Ntot) { let v = acc[13]; if (gn1 < p.N0) { out0[gm3 * p.N0 + gn1] = v; } else if (gn1 < p.N0 + p.N1) { out1[gm3 * p.N1 + (gn1 - p.N0)] = v; } else { out2[gm3 * p.N2 + (gn1 - p.N0 - p.N1)] = v; } }
+      let gn2 = tileN + tc + 2u; if (gn2 < Ntot) { let v = acc[14]; if (gn2 < p.N0) { out0[gm3 * p.N0 + gn2] = v; } else if (gn2 < p.N0 + p.N1) { out1[gm3 * p.N1 + (gn2 - p.N0)] = v; } else { out2[gm3 * p.N2 + (gn2 - p.N0 - p.N1)] = v; } }
+      let gn3 = tileN + tc + 3u; if (gn3 < Ntot) { let v = acc[15]; if (gn3 < p.N0) { out0[gm3 * p.N0 + gn3] = v; } else if (gn3 < p.N0 + p.N1) { out1[gm3 * p.N1 + (gn3 - p.N0)] = v; } else { out2[gm3 * p.N2 + (gn3 - p.N0 - p.N1)] = v; } }
     }
   }
 }
