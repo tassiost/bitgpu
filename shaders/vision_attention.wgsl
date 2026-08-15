@@ -68,19 +68,49 @@ fn main(
   // Load Q into registers as vec4 array (18 vec4 = 72 floats)
   var q_vec: array<vec4<f32>, HD4>;
   if (seg_valid && head_valid && q_valid) {
-    for (var d4 = 0u; d4 < HD4; d4 = d4 + 1u) {
-      let b = q_base + d4 * 4u;
-      q_vec[d4] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]);
-    }
+    { let b = q_base + 0u * 4u; q_vec[0u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 1u * 4u; q_vec[1u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 2u * 4u; q_vec[2u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 3u * 4u; q_vec[3u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 4u * 4u; q_vec[4u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 5u * 4u; q_vec[5u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 6u * 4u; q_vec[6u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 7u * 4u; q_vec[7u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 8u * 4u; q_vec[8u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 9u * 4u; q_vec[9u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 10u * 4u; q_vec[10u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 11u * 4u; q_vec[11u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 12u * 4u; q_vec[12u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 13u * 4u; q_vec[13u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 14u * 4u; q_vec[14u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 15u * 4u; q_vec[15u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 16u * 4u; q_vec[16u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
+    { let b = q_base + 17u * 4u; q_vec[17u] = vec4<f32>(q[b], q[b + 1u], q[b + 2u], q[b + 3u]); }
   }
 
   // Online softmax state
   var max_score = -3.0e38;
   var sum_exp = 0.0;
   var acc: array<vec4<f32>, HD4>;
-  for (var d4 = 0u; d4 < HD4; d4 = d4 + 1u) {
-    acc[d4] = vec4<f32>(0.0);
-  }
+  acc[0u] = vec4<f32>(0.0);
+  acc[1u] = vec4<f32>(0.0);
+  acc[2u] = vec4<f32>(0.0);
+  acc[3u] = vec4<f32>(0.0);
+  acc[4u] = vec4<f32>(0.0);
+  acc[5u] = vec4<f32>(0.0);
+  acc[6u] = vec4<f32>(0.0);
+  acc[7u] = vec4<f32>(0.0);
+  acc[8u] = vec4<f32>(0.0);
+  acc[9u] = vec4<f32>(0.0);
+  acc[10u] = vec4<f32>(0.0);
+  acc[11u] = vec4<f32>(0.0);
+  acc[12u] = vec4<f32>(0.0);
+  acc[13u] = vec4<f32>(0.0);
+  acc[14u] = vec4<f32>(0.0);
+  acc[15u] = vec4<f32>(0.0);
+  acc[16u] = vec4<f32>(0.0);
+  acc[17u] = vec4<f32>(0.0);
+
 
   // Process K/V in tiles of TILE_SIZE
   for (var tile_start = 0u; tile_start < seg_len; tile_start = tile_start + TILE_SIZE) {
@@ -90,11 +120,25 @@ fn main(
     if (lid.x < tile_len) {
       let kv_global = seg_start + tile_start + lid.x;
       let kv_base = kv_global * p.num_heads * p.head_dim + head * p.head_dim;
-      for (var d4 = 0u; d4 < HD4; d4 = d4 + 1u) {
-        let b = kv_base + d4 * 4u;
-        shared_k[lid.x * HD4 + d4] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]);
-        shared_v[lid.x * HD4 + d4] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]);
-      }
+      { let b = kv_base + 0u * 4u; shared_k[lid.x * HD4 + 0u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 0u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 1u * 4u; shared_k[lid.x * HD4 + 1u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 1u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 2u * 4u; shared_k[lid.x * HD4 + 2u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 2u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 3u * 4u; shared_k[lid.x * HD4 + 3u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 3u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 4u * 4u; shared_k[lid.x * HD4 + 4u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 4u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 5u * 4u; shared_k[lid.x * HD4 + 5u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 5u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 6u * 4u; shared_k[lid.x * HD4 + 6u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 6u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 7u * 4u; shared_k[lid.x * HD4 + 7u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 7u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 8u * 4u; shared_k[lid.x * HD4 + 8u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 8u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 9u * 4u; shared_k[lid.x * HD4 + 9u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 9u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 10u * 4u; shared_k[lid.x * HD4 + 10u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 10u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 11u * 4u; shared_k[lid.x * HD4 + 11u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 11u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 12u * 4u; shared_k[lid.x * HD4 + 12u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 12u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 13u * 4u; shared_k[lid.x * HD4 + 13u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 13u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 14u * 4u; shared_k[lid.x * HD4 + 14u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 14u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 15u * 4u; shared_k[lid.x * HD4 + 15u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 15u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 16u * 4u; shared_k[lid.x * HD4 + 16u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 16u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+      { let b = kv_base + 17u * 4u; shared_k[lid.x * HD4 + 17u] = vec4<f32>(k[b], k[b + 1u], k[b + 2u], k[b + 3u]); shared_v[lid.x * HD4 + 17u] = vec4<f32>(v[b], v[b + 1u], v[b + 2u], v[b + 3u]); }
+
     }
     workgroupBarrier();
 
@@ -103,9 +147,25 @@ fn main(
       for (var t = 0u; t < tile_len; t = t + 1u) {
         // Q · K dot product using vec4 (18 dot products instead of 72 scalar multiply-adds)
         var score = 0.0;
-        for (var d4 = 0u; d4 < HD4; d4 = d4 + 1u) {
-          score = score + dot(q_vec[d4], shared_k[t * HD4 + d4]);
-        }
+        score = score + dot(q_vec[0u], shared_k[t * HD4 + 0u]);
+        score = score + dot(q_vec[1u], shared_k[t * HD4 + 1u]);
+        score = score + dot(q_vec[2u], shared_k[t * HD4 + 2u]);
+        score = score + dot(q_vec[3u], shared_k[t * HD4 + 3u]);
+        score = score + dot(q_vec[4u], shared_k[t * HD4 + 4u]);
+        score = score + dot(q_vec[5u], shared_k[t * HD4 + 5u]);
+        score = score + dot(q_vec[6u], shared_k[t * HD4 + 6u]);
+        score = score + dot(q_vec[7u], shared_k[t * HD4 + 7u]);
+        score = score + dot(q_vec[8u], shared_k[t * HD4 + 8u]);
+        score = score + dot(q_vec[9u], shared_k[t * HD4 + 9u]);
+        score = score + dot(q_vec[10u], shared_k[t * HD4 + 10u]);
+        score = score + dot(q_vec[11u], shared_k[t * HD4 + 11u]);
+        score = score + dot(q_vec[12u], shared_k[t * HD4 + 12u]);
+        score = score + dot(q_vec[13u], shared_k[t * HD4 + 13u]);
+        score = score + dot(q_vec[14u], shared_k[t * HD4 + 14u]);
+        score = score + dot(q_vec[15u], shared_k[t * HD4 + 15u]);
+        score = score + dot(q_vec[16u], shared_k[t * HD4 + 16u]);
+        score = score + dot(q_vec[17u], shared_k[t * HD4 + 17u]);
+
         score = score * p.scale;
 
         // Online softmax update (flash-attention)
@@ -115,9 +175,25 @@ fn main(
         let weight = exp(score - max_score);
         sum_exp = sum_exp * correction + weight;
         // V accumulation with vec4 (18 vec4 multiply-adds instead of 72 scalar)
-        for (var d4 = 0u; d4 < HD4; d4 = d4 + 1u) {
-          acc[d4] = acc[d4] * correction + weight * shared_v[t * HD4 + d4];
-        }
+        acc[0u] = acc[0u] * correction + weight * shared_v[t * HD4 + 0u];
+        acc[1u] = acc[1u] * correction + weight * shared_v[t * HD4 + 1u];
+        acc[2u] = acc[2u] * correction + weight * shared_v[t * HD4 + 2u];
+        acc[3u] = acc[3u] * correction + weight * shared_v[t * HD4 + 3u];
+        acc[4u] = acc[4u] * correction + weight * shared_v[t * HD4 + 4u];
+        acc[5u] = acc[5u] * correction + weight * shared_v[t * HD4 + 5u];
+        acc[6u] = acc[6u] * correction + weight * shared_v[t * HD4 + 6u];
+        acc[7u] = acc[7u] * correction + weight * shared_v[t * HD4 + 7u];
+        acc[8u] = acc[8u] * correction + weight * shared_v[t * HD4 + 8u];
+        acc[9u] = acc[9u] * correction + weight * shared_v[t * HD4 + 9u];
+        acc[10u] = acc[10u] * correction + weight * shared_v[t * HD4 + 10u];
+        acc[11u] = acc[11u] * correction + weight * shared_v[t * HD4 + 11u];
+        acc[12u] = acc[12u] * correction + weight * shared_v[t * HD4 + 12u];
+        acc[13u] = acc[13u] * correction + weight * shared_v[t * HD4 + 13u];
+        acc[14u] = acc[14u] * correction + weight * shared_v[t * HD4 + 14u];
+        acc[15u] = acc[15u] * correction + weight * shared_v[t * HD4 + 15u];
+        acc[16u] = acc[16u] * correction + weight * shared_v[t * HD4 + 16u];
+        acc[17u] = acc[17u] * correction + weight * shared_v[t * HD4 + 17u];
+
       }
     }
 
@@ -127,13 +203,24 @@ fn main(
   // Normalize and write output using vec4
   if (seg_valid && head_valid && q_valid) {
     let inv_sum = 1.0 / sum_exp;
-    for (var d4 = 0u; d4 < HD4; d4 = d4 + 1u) {
-      let o = acc[d4] * inv_sum;
-      let b = q_base + d4 * 4u;
-      out[b] = o.x;
-      out[b + 1u] = o.y;
-      out[b + 2u] = o.z;
-      out[b + 3u] = o.w;
-    }
+    { let o = acc[0u] * inv_sum; let b = q_base + 0u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[1u] * inv_sum; let b = q_base + 1u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[2u] * inv_sum; let b = q_base + 2u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[3u] * inv_sum; let b = q_base + 3u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[4u] * inv_sum; let b = q_base + 4u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[5u] * inv_sum; let b = q_base + 5u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[6u] * inv_sum; let b = q_base + 6u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[7u] * inv_sum; let b = q_base + 7u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[8u] * inv_sum; let b = q_base + 8u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[9u] * inv_sum; let b = q_base + 9u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[10u] * inv_sum; let b = q_base + 10u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[11u] * inv_sum; let b = q_base + 11u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[12u] * inv_sum; let b = q_base + 12u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[13u] * inv_sum; let b = q_base + 13u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[14u] * inv_sum; let b = q_base + 14u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[15u] * inv_sum; let b = q_base + 15u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[16u] * inv_sum; let b = q_base + 16u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+    { let o = acc[17u] * inv_sum; let b = q_base + 17u * 4u; out[b] = o.x; out[b + 1u] = o.y; out[b + 2u] = o.z; out[b + 3u] = o.w; }
+
   }
 }
