@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html><body><pre id="out">Testing SubgroupMatrix...</pre>
+<script>
+(async () => {
+  const out = document.getElementById('out');
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) { out.textContent = 'No adapter'; return; }
+
+  const device = await adapter.requestDevice({
+    requiredFeatures: ['chromium-experimental-subgroup-matrix', 'shader-f16']
+  });
+
+  const shader = device.createShaderModule({
+    code: `
+      enable f16;
+      enable chromium_experimental_subgroup_matrix;
+      diagnostic(off, chromium.subgroup_matrix_uniformity);
+
+      @group(0) @binding(0) var<storage, read> a: array<f16>;
+      @group(0) @binding(1) var<storage, read> b: array<f16>;
+      @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+
+      @compute @workgroup_size(32)
+      fn main() {
+        // 8x8x8 f16 matmul using SubgroupMatrix
+        var left = subgroupMatrixLoad<subgroup_matrix_left<f16, 8, 8>>(&a, 0, false, 8);
+        var right = subgroupMatrixLoad<subgroup_matrix_right<f16, 8, 8>>(&b, 0, false, 8);
+        var result = subgroupMatrixMultiplyAccumulate(left, right, subgroup_matrix_result<f32, 8, 8>());
+        subgroupMatrixStore(&c, 0, result, false, 8);
+      }
+    `
+  });
+
+  const log = (msg) => { out.textContent += '\n' + msg; };
+
+  shader.getCompilationInfo().then(info => {
+    for (const msg of info.messages) {
+      log(`[${msg.type}] ${msg.message}`);
+    }
+  });
+
+  // Test with simple data
+  const aBuf = device.createBuffer({
+    size: 64 * 2, // 8x8 f16 = 128 bytes
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+  });
+  const bBuf = device.createBuffer({
+    size: 64 * 2,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+  });
+  const cBuf = device.createBuffer({
+    size: 64 * 4, // 8x8 f32 = 256 bytes
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
+  });
+
+  // Fill A with 1.0, B with 2.0 (in f16)
+  const aData = new Uint16Array(64).fill(0x3C00); // f16 1.0
+  const bData = new Uint16Array(64).fill(0x4000); // f16 2.0
+  device.queue.writeBuffer(aBuf, 0, aData);
+  device.queue.writeBuffer(bBuf, 0, bData);
+
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module: shader } });
+  const bindGroup = device.createBindGroup({
+    layout: pipeline.getBindGroupLayout(0),
+    entries: [{ binding: 0, resource: { buffer: aBuf } }, { binding: 1, resource: { buffer: bBuf } }, { binding: 2, resource: { buffer: cBuf } }]
+  });
+
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+
+  // Read back
+  const readBuf = device.createBuffer({ size: 256, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const enc2 = device.createCommandEncoder();
+  enc2.copyBufferToBuffer(cBuf, 0, readBuf, 0, 256);
+  device.queue.submit([enc2.finish()]);
+
+  await readBuf.mapAsync(GPUMapMode.READ);
+  const result = new Float32Array(readBuf.getMappedRange());
+  const vals = Array.from(result.slice(0, 8));
+  log('Result (first 8 values, should be 16.0): ' + vals.map(v => v.toFixed(1)).join(', '));
+  log('All 64 values: ' + Array.from(result).map(v => v.toFixed(1)).join(', '));
+  readBuf.unmap();
+
+  log('\nSubgroupMatrix test PASSED!');
+  device.destroy();
+})().catch(e => { document.getElementById('out').textContent += '\nERROR: ' + e.message; });
+</script></body></html>

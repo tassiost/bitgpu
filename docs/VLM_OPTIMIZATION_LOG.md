@@ -830,3 +830,56 @@ Cumulative improvement: ~32% faster vision tower forward pass through:
 2. BKV=8 full Q8_0 block processing (18%)
 3. Attention shader d4 loop unrolling (2%)
 4. Explicit multiply-add replacing dot() (4%)
+
+### 2026-08-17: SubgroupMatrix experiment (REVERTED — slower)
+
+**SubgroupMatrix feature detection**: Confirmed `chromium-experimental-subgroup-matrix`
+is available on this Apple Silicon device (M-series). Also confirmed `subgroups`
+and `shader-f16` are available. Basic 8×8×8 f16 matmul test passed correctly.
+
+**SubgroupMatrix Q8 matmul shader**: Implemented `vision_matmul_q8_sgmat`,
+`vision_matmul_q8_sgmat_add`, `vision_matmul_q8_sgmat_gelu`, and
+`vision_matmul_f16_sgmat_add` using hardware tensor cores (Metal simdgroup_matrix).
+
+Configuration tested:
+- 8 subgroups per WG (SUBGROUP_M=2, SUBGROUP_N=4), 256 threads total
+- 8×8×8 f16 matmul tiles with f32 accumulator
+- TILE_K=32 (4 SubgroupMatrix K-steps per shared memory load)
+- Workgroup output tile: 16×32 = 512 elements
+- Shared memory: 512 + 1024 + 512 = 2048 f16 + 512 f32 = 5KB total
+
+Results:
+- TILE_K=8 (1 SGM step per load): 6175ms avg (1.87× slower than tiled)
+- TILE_K=32 (4 SGM steps per load): 4834ms avg (1.47× slower than tiled)
+
+The SubgroupMatrix approach is slower because:
+1. **Small workgroup tile** (16×32=512) vs tiled (64×64=4096) → 8× more dispatches
+2. **f32→f16 conversion overhead** for X activations and Q8→f16 dequantization for W
+3. **8×8 tile size too small** for these matrix dimensions (234×1152, 234×3456)
+4. The tiled shader's 4×4 register tiles per thread (16 accumulators) are already
+   well-optimized for Apple Silicon's SIMD architecture
+
+SubgroupMatrix works best for large matrices (1024×1024+) where the hardware
+tensor core throughput dominates. For the vision tower's smaller matrices,
+the manual tiled approach with explicit FMA is faster.
+
+**Key learning**: SubgroupMatrix on Apple Silicon uses 8×8 simdgroup_matrix tiles.
+With max 256 threads/WG (8 subgroups), the workgroup tile is limited to 16×32 or
+similar. This is 8× smaller than the 64×64 tiled shader, causing dispatch overhead
+and poor L1 cache utilization to dominate.
+
+### Research findings (2025-2026 WebGPU optimization techniques)
+
+Researched latest WebGPU VLM optimization techniques. Key findings:
+
+1. **SubgroupMatrix**: Available on Apple Silicon but needs large matrices to win
+2. **F16 activations**: Widely used in production (Janus-Pro-7B, WebLLM q4f16).
+   Halves activation bandwidth. Low risk, high impact.
+3. **Kernel fusion**: 66-458× speedup possible. LayerNorm+MatMul and QKV+RoPE
+   fusion save 54+ dispatches per forward pass.
+4. **Q8_0 weight reorder**: 3.1× speedup on Intel (separate scales from data).
+   Not yet tested on Apple Silicon.
+5. **Dispatch overhead**: 24-71 µs per dispatch on Metal. Already minimized by
+   batching all 27 layers into one compute pass.
+6. **Packed 4x8 integer dot product**: Available in Chrome 123+. 1.6-2.9× faster
+   than f16 for 8-bit data. Could help Q8 dequantization.

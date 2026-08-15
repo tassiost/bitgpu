@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><body><pre id="out">Loading...</pre>
+<script>
+(async () => {
+  const adapter = await navigator.gpu.requestAdapter();
+  const out = document.getElementById('out');
+  if (!adapter) { out.textContent = 'No adapter'; return; }
+  const features = [...adapter.features].sort();
+  out.textContent = 'Adapter features:\n' + features.join('\n') +
+    '\n\nAdapter info:\n' + JSON.stringify(adapter.info || {}, null, 2);
+  
+  // Try requesting subgroup matrix
+  try {
+    const device = await adapter.requestDevice({
+      requiredFeatures: ['chromium-experimental-subgroup-matrix']
+    });
+    out.textContent += '\n\nSubgroupMatrix: AVAILABLE';
+  } catch(e) {
+    out.textContent += '\n\nSubgroupMatrix: ' + e.message;
+  }
+  // Try subgroups
+  try {
+    const device = await adapter.requestDevice({
+      requiredFeatures: ['subgroups']
+    });
+    out.textContent += '\nSubgroups: AVAILABLE';
+  } catch(e) {
+    out.textContent += '\nSubgroups: ' + e.message;
+  }
+})();
+</script></body></html>
