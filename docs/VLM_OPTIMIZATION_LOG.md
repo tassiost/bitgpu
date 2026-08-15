@@ -1107,3 +1107,285 @@ Researched latest WebGPU VLM optimization techniques. Key findings:
 6. **Kernel fusion**: ONNX Runtime shows 25-30% speedup from fusion. But
    our fused LN+QKV experiment showed fusion can be slower when it
    requires higher device limits or redundant computation.
+
+---
+
+## 2026-08-15: M-RoPE (IMROPE) support for Qwen3-VL — CRITICAL FIX
+
+### Problem
+
+The Qwen3-VL model uses Interleaved M-RoPE (IMROPE) with 4D position IDs
+(t, x, y, z) for image tokens. The WebGPU engine was using standard 1D
+sequential RoPE for all tokens, causing the VLM to hallucinate garbage
+instead of describing image content. The model could not "see" images.
+
+### Root cause
+
+The Qwen3-VL architecture uses `GGML_ROPE_TYPE_IMROPE` with M-RoPE sections
+defining how the head_dim frequency pairs are split across the 4 position
+dimensions (temporal, height, width, z). For the Bonsai-27B model, the
+sections are `[11, 11, 10, 0]` (parsed from the GGUF metadata key
+`qwen3vl.rope.dimension_sections`).
+
+The standard 1D RoPE was applying the same sequential position to all
+frequency pairs, which is correct for text-only models but wrong for
+multimodal models that need spatial position encoding for image tokens.
+
+### Fix
+
+Three changes were needed:
+
+1. **Parse M-RoPE sections from GGUF** (`src/gguf.ts`):
+   Added `mropeSections` to the model arch metadata, reading from
+   `qwen3vl.rope.dimension_sections` (or `qwen2vl.rope.dimension_sections`).
+
+2. **Compute per-frequency-pair cos/sin for M-RoPE** (`src/engine.ts`):
+   The `ropeBufs` function now computes cos/sin values using the correct
+   position dimension for each frequency pair. For IMROPE, frequency pair `j`
+   uses position dimension `j % 3` (cycling t/h/w), with section boundaries
+   defined by `mropeSections`. The 4th dimension (z) is unused for Qwen3-VL
+   (section size 0).
+
+3. **Compute 2D grid positions for image tokens** (`src/engine.ts`):
+   `generateWithImages` now computes M-RoPE positions for the full prompt
+   (text + image tokens). For image tokens at grid position (row, col):
+   - `pos.t = pos_0` (temporal = base position, same for all image tokens)
+   - `pos.x = pos_0 + col` (width = base + column index)
+   - `pos.y = pos_0 + row` (height = base + row index)
+   - `pos.z = 0` (unused)
+   
+   This matches llama.cpp's `mtmd_image_tokens_get_decoder_pos` function
+   in `tools/mtmd/mtmd.cpp`. For text tokens, all 4 dimensions are the same
+   sequential position: `[pos, pos, pos, pos]`.
+
+### Key insight: IMROPE is halved, not interleaved rotation
+
+A critical insight was that IMROPE uses **halved rotation** (NEOX-style
+`rotate_half`), NOT interleaved rotation (GPT-J style). The "I" in IMROPE
+refers to **interleaved section assignment** (cycling t/h/w per frequency
+pair), not interleaved rotation.
+
+This means the existing `rope_partial` shader works correctly — only the
+cos/sin values differ. The rotation method (rotate_half) is the same as
+standard NeoX RoPE. The difference is purely in which position dimension
+(t, x, y, or z) is used for each frequency pair when computing the cos/sin
+table.
+
+### Verification
+
+After the fix, the VLM successfully described a synthetic image with
+colored shapes, correctly identifying colors and approximate shapes.
+The model output was considered acceptable given the aggressive Q1_0
+quantization (1.5 bits/weight).
+
+### Range error fix (vision weight loading)
+
+A secondary issue was `RangeError: offset is out of bounds` during vision
+weights loading. This was caused by the HTTP server not supporting `Range`
+requests, leading to corrupted vision weights (the server returned the
+full file instead of the requested byte range).
+
+**Fix**: Updated the Python HTTP server to handle `Range` requests
+correctly, and added a slice in `vision.ts` to ensure only the requested
+bytes are processed even if the server returns more.
+
+### Files changed
+
+- `src/gguf.ts`: Parse `mropeSections` from GGUF metadata
+- `src/types.ts`: Add `mropeSections` to arch type
+- `src/engine.ts`: Compute M-RoPE cos/sin in `ropeBufs`, compute 2D
+  positions for image tokens in `generateWithImages`, thread M-RoPE
+  positions through prefill and decode paths
+- `src/vision.ts`: Slice response to expected length in weight loading
+- `shaders/rope_imrope.wgsl`: New shader for IMROPE rotation (uses
+  halved rotation with per-section cos/sin)
+
+### Reference
+
+- llama.cpp `tools/mtmd/mtmd.cpp`: `mtmd_image_tokens_get_decoder_pos`
+  function defines the 4D position computation for image tokens
+- llama.cpp PR #16780: Added Qwen3-VL support including IMROPE
+- GGUF metadata: `qwen3vl.rope.dimension_sections = [11, 11, 10, 0]`
+  for Bonsai-27B (head_dim=72, 36 frequency pairs: 11 t + 11 h + 10 w + 0 z)
+
+---
+
+## 2026-08-15: DP4a vision matmul shader (TESTED, DISABLED)
+
+### Approach
+
+Created a `vision_matmul_q8_dp4a.wgsl` shader that uses the
+`packed_4x8_integer_dot_product` WGSL feature (`dot4I8Packed` builtin)
+for 4-way int8 dot products instead of f32 FMA. This feature IS available
+in the current Chrome environment (confirmed via
+`navigator.gpu.wgslLanguageFeatures`).
+
+The shader:
+- Keeps W as packed int8 in shared memory (no dequantization to f32)
+- Quantizes X (activations) to int8 on the fly with a per-row scale
+- Uses `dot4I8Packed` for the inner dot product loop
+- Rescales the result by `(x_scale * w_scale)` at the end
+
+### Result: 6× SLOWER (disabled)
+
+The DP4a path is 6× slower than the existing f32-dequant Q8 tiled path:
+- DP4a: 1761ms for 27 layers (256 patches)
+- Q8 tiled (baseline): 291ms for 27 layers (256 patches)
+
+### Root cause
+
+The per-row X quantization requires a serial amax scan where only 1 of
+256 threads is active for 64 sequential steps (one thread per row,
+serializing the amax computation). This completely dominates the runtime
+and negates any benefit from `dot4I8Packed`.
+
+The shader uses `if (tid == m)` to assign one thread per row for the amax
+computation, which means 255 of 256 threads are idle during each row's
+amax scan. With 64 rows, this is 64 sequential steps with 1/256 thread
+utilization — a massive parallelism loss.
+
+### How to make DP4a viable
+
+The fix would be to **pre-quantize X in a separate dispatch** before the
+matmul. This would:
+1. Run a dedicated quantization shader (one workgroup per row, all threads
+   cooperating on the amax scan and int8 packing)
+2. Store the quantized X + per-row scales in a buffer
+3. The matmul shader then reads pre-quantized X (no in-shader quantization)
+
+This would eliminate the serial amax bottleneck and let the matmul shader
+benefit from `dot4I8Packed`'s 4-way int8 dot product throughput.
+
+### Current state
+
+The shader and wiring are kept but disabled (`useDP4a = false`). The
+shader is registered in the vision shader list when
+`packed_4x8_integer_dot_product` is available, and the dispatch paths
+are wired up in the vision forward, but the `useDP4a` flag is hardcoded
+to `false` to prevent the 6× regression.
+
+### Files changed
+
+- `shaders/vision_matmul_q8_dp4a.wgsl` (new — DP4a Q8 matmul with
+  on-the-fly X quantization)
+- `src/engine.ts` (register shader, wire up dispatch paths, disabled)
+
+### Lessons
+
+1. **On-the-fly quantization is expensive**: Serial per-row amax scans
+   with 1/256 thread utilization can dominate runtime. Always pre-compute
+   in a separate parallel dispatch.
+2. **DP4a requires both operands as int8**: Unlike f32 FMA where X can
+   stay as f32, `dot4I8Packed` needs both inputs packed as int8. The
+   quantization cost must be amortized across multiple matmuls or
+   pre-computed.
+3. **Feature availability ≠ performance**: Just because a WGSL feature
+   is available doesn't mean using it will be faster. The overhead of
+   data format conversion can negate the instruction-level speedup.
+
+---
+
+## 2026-08-15: Vision tower GPU path — already wired up
+
+### Finding
+
+During investigation of vision performance, discovered that the GPU vision
+forward path was **already fully implemented and working**. The vision
+tower runs entirely on GPU with:
+- Q8_0 tiled matmul shaders (64×64 tiles, 256 threads, 4×4 register tiles)
+- F16 tiled matmul for FFN down weights
+- Pre-computed 2D RoPE for Q/K
+- Shared-memory tiled attention with vec4 dot products
+- All 27 transformer layers batched into one compute pass
+
+The `visionForward` function in `src/vision.ts` (CPU path) is NOT used —
+the engine's own `visionForward` in `src/engine.ts` (GPU path) is the
+active code path, exported via the engine API.
+
+### Performance (Playwright Chromium, no subgroups)
+
+- **256 patches (64 merged)**: ~291ms for 27 layers, ~65ms CPU preprocess
+- **234 patches (screenshot)**: ~2707ms total (includes weight loading)
+- **Bottleneck**: Q8 tiled matmul without tensor cores (SGMat not available
+  in Playwright's Chromium)
+
+### Available WGSL features (Playwright Chromium)
+
+- `packed_4x8_integer_dot_product` — available (DP4a)
+- `subgroup_uniformity`, `subgroup_id` — available
+- `chromium_experimental_subgroup_matrix` — NOT available
+- `chromium_experimental_subgroups` — NOT available
+
+The SGMat (tensor core) shaders are wired but dormant because the
+`chromium_experimental_subgroup_matrix` extension is not available. The
+fallback path (64×64 manual FMA tiled) is the active code path.
+
+### Performance breakdown (256 patches, 27 layers)
+
+| Phase | Time | Notes |
+|-------|------|-------|
+| CPU preprocess | 65ms | Image resize + patch extraction + pos embed interp |
+| Patch embed + pos add | ~5ms | GPU dispatch (separate submit) |
+| 27 transformer layers | ~291ms | GPU compute (one compute pass, 7 dispatches/layer) |
+| Merger + readback | ~8ms | Patch merger + mm.0 + mm.2 + GPU→CPU readback |
+| **Total** | **~369ms** | |
+
+Per-layer breakdown (~10.8ms/layer):
+- LayerNorm1: ~0.5ms
+- QKV projection (Q8 tiled): ~2.5ms
+- 2D RoPE: ~0.5ms
+- Attention (vec4, tiled): ~2.0ms
+- Attn output proj + residual (Q8 tiled add): ~1.5ms
+- LayerNorm2: ~0.5ms
+- FFN up + GELU (Q8 tiled gelu): ~2.0ms
+- FFN down + residual (F16 tiled add): ~1.3ms
+
+---
+
+## Summary: Current VLM state (2026-08-15)
+
+### What works
+- ✅ M-RoPE (IMROPE) for image tokens — model can "see" images
+- ✅ Vision tower GPU forward — 291ms for 256 patches (no subgroups)
+- ✅ Vision weight preloading — overlapped with LLM model loading
+- ✅ Q8_0 in-shader dequantization — 2.75× weight bandwidth reduction
+- ✅ F16 storage for FFN down — further 1.45× bandwidth reduction
+- ✅ 2D tiled matmul — eliminates redundant W reads
+- ✅ vec4 attention — 29% faster scalar→vectorized
+- ✅ Position embedding interpolation (align_corners=True) — matches reference
+
+### What doesn't work (yet)
+- ❌ SGMat (tensor core) shaders — `chromium_experimental_subgroup_matrix`
+  not available in Playwright Chromium (would give significant speedup)
+- ❌ DP4a matmul — 6× slower due to on-the-fly X quantization overhead
+  (would need pre-quantization dispatch to be viable)
+- ❌ Speculative decoding — disabled for hybrid backbone (Bonsai-27B uses
+  Gated DeltaNet + attention; rejected drafts corrupt recurrent state)
+
+### Improvement opportunities (ranked by impact)
+
+1. **Use Q4_K_M quantization** (biggest quality win, no code change):
+   Q1_0 (1.5 bits/weight) destroys too much information. The model
+   correctly identifies colors but struggles with shapes. Q4_K_M would
+   dramatically improve vision quality.
+
+2. **SGMat on real browser** (biggest speed win):
+   On a browser with `chromium_experimental_subgroup_matrix`, the SGMat
+   path would use hardware tensor cores for a significant speedup. The
+   shaders are already written and wired up.
+
+3. **Pre-quantize X for DP4a** (medium speed win):
+   A separate dispatch to quantize X to int8 before the DP4a matmul would
+   eliminate the serial amax bottleneck and unlock `dot4I8Packed`'s 4-way
+   int8 dot product throughput.
+
+4. **F16 activations** (medium speed win):
+   Halves activation bandwidth (916→458 MB). Currently low priority since
+   the vision tower is compute-bound, but would help if combined with
+   SGMat or DP4a.
+
+5. **Kernel fusion** (small speed win):
+   Fusing LayerNorm+QKV or RoPE+attention could save 54+ dispatches.
+   Previous attempts were slower due to barrier overhead, but fusion
+   without reductions (e.g., RoPE+attention) might work.
+
