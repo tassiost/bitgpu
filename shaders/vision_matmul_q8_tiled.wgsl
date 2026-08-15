@@ -115,22 +115,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
       let w1 = ws[(tc + 1u) * BKV + kv];
       let w2 = ws[(tc + 2u) * BKV + kv];
       let w3 = ws[(tc + 3u) * BKV + kv];
-      acc[ 0] = acc[ 0] + dot(xr0, w0);
-      acc[ 1] = acc[ 1] + dot(xr0, w1);
-      acc[ 2] = acc[ 2] + dot(xr0, w2);
-      acc[ 3] = acc[ 3] + dot(xr0, w3);
-      acc[ 4] = acc[ 4] + dot(xr1, w0);
-      acc[ 5] = acc[ 5] + dot(xr1, w1);
-      acc[ 6] = acc[ 6] + dot(xr1, w2);
-      acc[ 7] = acc[ 7] + dot(xr1, w3);
-      acc[ 8] = acc[ 8] + dot(xr2, w0);
-      acc[ 9] = acc[ 9] + dot(xr2, w1);
-      acc[10] = acc[10] + dot(xr2, w2);
-      acc[11] = acc[11] + dot(xr2, w3);
-      acc[12] = acc[12] + dot(xr3, w0);
-      acc[13] = acc[13] + dot(xr3, w1);
-      acc[14] = acc[14] + dot(xr3, w2);
-      acc[15] = acc[15] + dot(xr3, w3);
+      acc[ 0] = acc[ 0] + xr0.x*w0.x + xr0.y*w0.y + xr0.z*w0.z + xr0.w*w0.w;
+      acc[ 1] = acc[ 1] + xr0.x*w1.x + xr0.y*w1.y + xr0.z*w1.z + xr0.w*w1.w;
+      acc[ 2] = acc[ 2] + xr0.x*w2.x + xr0.y*w2.y + xr0.z*w2.z + xr0.w*w2.w;
+      acc[ 3] = acc[ 3] + xr0.x*w3.x + xr0.y*w3.y + xr0.z*w3.z + xr0.w*w3.w;
+      acc[ 4] = acc[ 4] + xr1.x*w0.x + xr1.y*w0.y + xr1.z*w0.z + xr1.w*w0.w;
+      acc[ 5] = acc[ 5] + xr1.x*w1.x + xr1.y*w1.y + xr1.z*w1.z + xr1.w*w1.w;
+      acc[ 6] = acc[ 6] + xr1.x*w2.x + xr1.y*w2.y + xr1.z*w2.z + xr1.w*w2.w;
+      acc[ 7] = acc[ 7] + xr1.x*w3.x + xr1.y*w3.y + xr1.z*w3.z + xr1.w*w3.w;
+      acc[ 8] = acc[ 8] + xr2.x*w0.x + xr2.y*w0.y + xr2.z*w0.z + xr2.w*w0.w;
+      acc[ 9] = acc[ 9] + xr2.x*w1.x + xr2.y*w1.y + xr2.z*w1.z + xr2.w*w1.w;
+      acc[10] = acc[10] + xr2.x*w2.x + xr2.y*w2.y + xr2.z*w2.z + xr2.w*w2.w;
+      acc[11] = acc[11] + xr2.x*w3.x + xr2.y*w3.y + xr2.z*w3.z + xr2.w*w3.w;
+      acc[12] = acc[12] + xr3.x*w0.x + xr3.y*w0.y + xr3.z*w0.z + xr3.w*w0.w;
+      acc[13] = acc[13] + xr3.x*w1.x + xr3.y*w1.y + xr3.z*w1.z + xr3.w*w1.w;
+      acc[14] = acc[14] + xr3.x*w2.x + xr3.y*w2.y + xr3.z*w2.z + xr3.w*w2.w;
+      acc[15] = acc[15] + xr3.x*w3.x + xr3.y*w3.y + xr3.z*w3.z + xr3.w*w3.w;
     }
 
     workgroupBarrier();
