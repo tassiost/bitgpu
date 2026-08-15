@@ -756,7 +756,18 @@ committed state.
 - Q8 tiled gelu (FFN up): BKV=4, both X+W in shared (8KB)
 - F16 tiled add (FFN down): BKV=4, both X+W in shared (8KB)
 
-**GPU forward pass**: ~1420ms for 27 layers (52ms/layer). This is 24× slower
-than the compute roofline (60.3ms). The gap is due to Q8 dequantization
-overhead (~4.5 instructions per FMA), shared memory barriers, and low
-occupancy (8KB shared = 2 WGs/core at 16KB limit).
+**GPU forward pass profiling** (via timestamp-query):
+- GPU time (27 layers): ~1360ms (actual on-GPU time)
+- CPU wall-clock: ~1420ms (60ms submit/queue overhead)
+- Per-layer: ~50.4ms
+- Weight loading: ~1657ms (4 parallel chunks)
+- Total vision tower: ~3020ms
+
+The GPU time of 1360ms is 22.5× slower than the compute roofline (60.3ms).
+The gap is due to Q8 dequantization overhead (~4.5 instructions per FMA),
+shared memory barriers (144 per dispatch for QKV), and low occupancy
+(8KB shared = 2 WGs/core at 16KB limit).
+
+**8-chunk parallel fetch**: Tested and reverted. 8 chunks was slower than 4
+(2317ms vs 1657ms weight loading) due to connection contention. 4 chunks
+is the sweet spot for localhost.
