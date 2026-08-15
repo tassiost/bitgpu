@@ -29,10 +29,16 @@ Bonsai-27B (Qwen3-VL) vision tower implementation in bitgpu.
 - Min: 2990ms, Max: 3241ms, Avg: 3124ms
 - Per-layer: 110.7ms/layer
 
-**Breakdown** (from internal profiling):
-- Weight loading: ~1.6s (bulk fetch + skip f32 dequantization)
-- GPU forward: ~1.4s (27 layers × 47ms/layer + patch embed + merger)
-- Second call (weights cached): ~1.4s only
+**Breakdown** (from timestamp-query profiling):
+- Weight loading: ~1.5s (4-chunk parallel fetch + skip f32 dequant + no-copy upload)
+  - HTTP fetch: ~1170ms (600MB, 4 parallel chunks)
+  - Parse+repack: ~300ms (fast f16ToF32 + direct byte access)
+  - GPU upload: ~300ms (no-copy writeBuffer with byteOffset)
+- GPU forward: ~1.36s (27 layers, measured via timestamp-query)
+  - Per-layer: ~50.4ms
+  - 22.5× slower than compute roofline (60.3ms)
+  - Bottleneck: Q8 dequantization overhead (~5.5 instructions per FMA)
+- Second call (weights cached): ~1.36s only
 
 **Red 32×32 image results**:
 
