@@ -42,8 +42,8 @@ fn f16ToBits(h: u32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let blockIdx = gid.x;
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
+  let blockIdx = (wid.y * nwg.x + wid.x) * 64u + lid.x;
   if (blockIdx >= p.numBlocks) { return; }
 
   let baseByte = blockIdx * 18u;

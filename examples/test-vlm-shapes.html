@@ -1,0 +1,110 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>VLM Shape Test</title></head>
+<body><pre id="out">idle</pre>
+<script type="module">
+  const out = document.getElementById('out')
+  const log = (s) => { out.textContent += '\n' + s }
+
+  function makeShapeImage() {
+    const w = 256, h = 256
+    const canvas = document.createElement('canvas')
+    canvas.width = w; canvas.height = h
+    const ctx = canvas.getContext('2d')
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, h)
+    const cx = 64, cy = 64, r = 40
+    // Top-left: red circle
+    ctx.fillStyle = '#ff0000'; ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill()
+    // Top-right: blue square
+    ctx.fillStyle = '#0000ff'; ctx.fillRect(w - cx - r, cy - r, r * 2, r * 2)
+    // Bottom-left: green triangle
+    ctx.fillStyle = '#00aa00'; ctx.beginPath()
+    ctx.moveTo(cx - r, h - cy + r); ctx.lineTo(cx + r, h - cy + r); ctx.lineTo(cx, h - cy - r); ctx.closePath(); ctx.fill()
+    // Bottom-right: yellow star
+    ctx.fillStyle = '#ffcc00'
+    const sx = w - cx, sy = h - cy
+    ctx.beginPath()
+    for (let i = 0; i < 10; i++) {
+      const angle = (i * Math.PI) / 5 - Math.PI / 2
+      const radius = i % 2 === 0 ? r : r * 0.4
+      const x = sx + Math.cos(angle) * radius, y = sy + Math.sin(angle) * radius
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y)
+    }
+    ctx.closePath(); ctx.fill()
+    const imageData = ctx.getImageData(0, 0, w, h)
+    const rgb = new Float32Array(3 * w * h)
+    for (let i = 0; i < w * h; i++) { rgb[i*3] = imageData.data[i*4]/255; rgb[i*3+1] = imageData.data[i*4+1]/255; rgb[i*3+2] = imageData.data[i*4+2]/255 }
+    return { rgb, width: w, height: h, frames: 1 }
+  }
+
+  async function run() {
+    out.textContent = ''
+    try {
+      const { createEngine } = await import('/dist/index.js')
+      const { fromGguf } = await import('/dist/gguf.js')
+      const { createChat } = await import('/dist/chat.js')
+
+      log('1. Generating shape image (256x256)...')
+      const image = makeShapeImage()
+
+      log('2. Creating engine...')
+      const t0 = performance.now()
+      const parsed = await fromGguf('http://localhost:8888/Bonsai-27B-Q1_0.gguf')
+      const engine = await createEngine({ ...parsed, visionMmprojUrl: 'http://localhost:8888/Bonsai-27B-mmproj-Q8_0.gguf', warmShaders: false })
+      log('   Engine created in ' + (performance.now() - t0).toFixed(0) + 'ms')
+
+      log('3. Loading tokenizer...')
+      const chat = await createChat(engine, { tokenizerJsonUrl: 'http://localhost:8888/tokenizer.json', tokenizerConfigUrl: 'http://localhost:8888/tokenizer_config.json' })
+      const tk = chat.tokenizer
+
+      log('4. Running vision tower...')
+      const t2 = performance.now()
+      const visResult = await engine.visionForward([image])
+      const numMerged = visResult.numPatches
+      log('   Vision tower: ' + numMerged + ' patches in ' + (performance.now() - t2).toFixed(0) + 'ms')
+
+      log('5. Building prompt...')
+      const promptText = 'What do you see in this image? Describe everything you can identify.'
+      const messages = [
+        { role: 'system', content: 'You are a helpful assistant.' },
+        { role: 'user', content: [
+          { type: 'text', text: promptText },
+          { type: 'image', image },
+        ] },
+      ]
+      const imageTokenId = 248056
+      const promptString = tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: false })
+      log('   Prompt: ' + JSON.stringify(promptString))
+      const promptIds = tk.encode(promptString, false)
+      log('   Encoded: ' + promptIds.length + ' tokens')
+      const imgPositions = []
+      for (let i = 0; i < promptIds.length; i++) { if (promptIds[i] === imageTokenId) imgPositions.push(i) }
+      log('   Image positions: ' + imgPositions.length + ' (need ' + numMerged + ')')
+      let finalIds = promptIds, finalImgPositions = imgPositions
+      if (imgPositions.length === 1 && numMerged > 1) {
+        const padPos = imgPositions[0]
+        finalIds = [...promptIds.slice(0, padPos), ...new Array(numMerged).fill(imageTokenId), ...promptIds.slice(padPos + 1)]
+        finalImgPositions = []; for (let i = 0; i < numMerged; i++) finalImgPositions.push(padPos + i)
+        log('   Expanded to ' + finalIds.length + ' tokens')
+      } else if (imgPositions.length !== numMerged) {
+        log('FATAL: position mismatch'); log('TEST_DONE'); return
+      }
+      log('6. Generating...')
+      const t3 = performance.now()
+      const result = await engine.generateWithImages(finalIds, finalImgPositions, [image], {
+        maxTokens: 256, temperature: 0.1, repetitionPenalty: 1.1, noRepeatNgramSize: 3,
+      })
+      log('   ' + result.tokens.length + ' tokens in ' + (performance.now() - t3).toFixed(0) + 'ms')
+      log('   Prefill: ' + (result.prefillMs?.toFixed(0) || '?') + 'ms, Decode: ' + (result.decodeMs?.toFixed(0) || '?') + 'ms')
+      const response = tk.decode(result.tokens, true)
+      log('\n=== VLM RESPONSE ===')
+      log(response)
+      log('=== END ===')
+      log('\nGround truth: top-left=red circle, top-right=blue square, bottom-left=green triangle, bottom-right=yellow star')
+      log('TEST_DONE')
+    } catch (e) {
+      log('FATAL: ' + e.message); log(e.stack || ''); log('TEST_DONE')
+    }
+  }
+  run()
+</script>
+</body></html>

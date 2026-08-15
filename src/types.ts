@@ -184,6 +184,18 @@ export interface EngineOptions {
   syncSteps?: number
   /** Prefill GEMM tiling: `'auto'` tiles once a prompt fills the 64-row tiles, `'always'`/`'never'` force it. Default `'auto'`. */
   prefillTiling?: 'auto' | 'always' | 'never'
+  /** Tiled attention: splits the O(N) KV cache scan into per-layer command encoders
+   *  with CPU-GPU syncs between layers. Avoids GPU watchdog timeouts on long prompts.
+   *  Requires subgroups + q8 KV cache + overflow 'error'. Default `false`. */
+  tiledAttention?: boolean
+  /** Tiled flash-attention: splits the O(N) cache scan into multiple GPU passes
+   *  within a single command encoder (no CPU-GPU syncs). Uses implicit WebGPU
+   *  barriers between passes. Requires subgroups + q8 KV cache + overflow 'error'.
+   *  Default `false`. */
+  flashAttention?: boolean
+  /** Tile size for tiled/flash attention (number of KV positions per tile).
+   *  Default `512`. */
+  attentionTileSize?: number
   /** Fuse RMSNorm into the decode matmul kernels (saves 2 dispatches/layer). Each matmul
    *  workgroup redundantly computes the sum-of-squares, but eliminates the separate
    *  rmsnorm_sg dispatch. Net win when kernel launch overhead > redundant compute.
@@ -528,6 +540,9 @@ export interface Engine {
    *  (it does for Bonsai-27B: both are 5120). Throws if the model has no vision tower.
    *  `imagePositions` must be sorted ascending and each < promptTokenIds.length. */
   generateWithImages?(promptTokenIds: number[], imagePositions: number[], images: ImageInput[], options?: GenerateOptions): Promise<GenerateResult>
+  /** Compute the number of image_token_id placeholders to insert for a given image.
+   *  Throws if the model has no vision tower. */
+  numImageTokens?(image: ImageInput): number
   /** Whether the model has a vision tower loaded and ready. `false` for text-only models
    *  (1.7B/4B/8B) and for the 27B before the mmproj pack is fetched. */
   readonly vision?: boolean

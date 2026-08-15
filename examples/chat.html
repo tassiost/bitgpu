@@ -108,7 +108,7 @@
 
     /* ── composer ── */
     footer { border-top: 1px solid var(--line); background: var(--card); padding: 10px 0 calc(10px + env(safe-area-inset-bottom)); }
-    .inputrow { display: flex; gap: 8px; }
+    .inputrow { display: flex; gap: 8px; align-items: center; }
     input[type="text"] {
       flex: 1; padding: 11px 14px; border-radius: 11px; border: 1px solid var(--line);
       background: var(--bg); color: var(--fg); font: inherit; font-size: 16px; min-width: 0;
@@ -116,6 +116,15 @@
     input[type="text"]:focus { outline: 2px solid var(--ring); outline-offset: -1px; border-color: transparent; }
     .storage { font: 12px/1.5 var(--mono); font-variant-numeric: tabular-nums; color: var(--muted); display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-top: 6px; }
     .storage button { font: inherit; font-size: 12px; padding: 3px 9px; }
+    /* image attachments */
+    #attRow { display: none; gap: 6px; flex-wrap: wrap; padding: 0 0 8px; }
+    #attRow.show { display: flex; }
+    .att { position: relative; }
+    .att img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+    .att .rm { position: absolute; top: -4px; right: -4px; width: 18px; height: 18px; border-radius: 50%; background: var(--danger); color: #fff; border: 0; font-size: 12px; line-height: 18px; text-align: center; cursor: pointer; padding: 0; }
+    button.attach { padding: 11px 12px; border-radius: 11px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; flex-shrink: 0; }
+    button.attach:hover:not(:disabled) { border-color: var(--muted); }
+    button.attach:disabled { opacity: .45; cursor: default; }
 
     /* ── schema editor ── */
     #schemaBox { display: none; padding: 8px 0 2px; }
@@ -194,13 +203,18 @@
       from the model's own token probabilities.<br /><br />
       Conversations <b>survive reloads</b>: close the tab, come back, load the same model - the
       chat continues instantly, because the model's working memory (the KV cache) is saved and
-      restored, not re-computed.
+      restored, not re-computed.<br /><br />
+      The <b>27B</b> model is vision-capable: click 📎 or paste an image (Ctrl+V) and ask
+      <i>"What's in this picture?"</i> - the vision tower runs entirely on your GPU.
     </div>
   </div></div></main>
 
   <footer><div class="wrap">
     <form id="form">
+      <div id="attRow"></div>
+      <input type="file" id="fileInput" accept="image/*" hidden />
       <div class="inputrow">
+        <button id="attach" class="attach" disabled title="Attach image (vision models only)">📎</button>
         <input type="text" id="prompt" placeholder="Load a model first..." autocomplete="off" disabled />
         <button id="send" class="primary" disabled>Send</button>
       </div>
@@ -224,7 +238,7 @@
       // Qwen3.5 hybrid 27B: committed manifest + aux like the others; weights stream from HF, tokenizer
       // from the -unpacked repo (the GGUF repo ships none). ~3.8 GB - wants 16 GB+. `gen` overrides the
       // sampling with PrismML's recommended settings for this model (temp 0.5 / top_p 0.85 / top_k 20).
-      'bonsai-27b-gguf': { data: `${PRISM('Bonsai-27B-gguf')}/Bonsai-27B-Q1_0.gguf`, tok: PRISM('Bonsai-27B-unpacked'), aux: 'Bonsai-27B-Q1_0.aux.bin', gen: { temperature: 0.5, topP: 0.85, topK: 20 } },
+      'bonsai-27b-gguf': { data: `${PRISM('Bonsai-27B-gguf')}/Bonsai-27B-Q1_0.gguf`, tok: PRISM('Bonsai-27B-unpacked'), aux: 'Bonsai-27B-Q1_0.aux.bin', mmproj: `${PRISM('Bonsai-27B-gguf')}/Bonsai-27B-mmproj-Q8_0.gguf`, gen: { temperature: 0.5, topP: 0.85, topK: 20 } },
       'bonsai-1.7b': { data: `${HF('Bonsai-1.7B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-1.7B-ONNX'), aux: 'bonsai.aux.bin' },
       'bonsai-4b': { data: `${HF('Bonsai-4B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-4B-ONNX'), aux: 'model_q1.aux.bin' },
       'bonsai-8b': { data: `${HF('Bonsai-8B-ONNX')}/onnx/model_q1.onnx_data`, tok: HF('Bonsai-8B-ONNX'), aux: 'model_q1.aux.bin' },
@@ -328,6 +342,7 @@
             manifestUrl: `${REPO}/${key}/manifest.json`,
             auxUrl: `${REPO}/${key}/${m.aux}`,
             dataUrl: m.data,
+            ...(m.mmproj ? { visionMmprojUrl: m.mmproj } : {}),
             // q8 KV: quarter-of-f32 cache memory on ANY adapter (no shader-f16 needed), which
             // pays for the 4096-token window and keeps session snapshots small.
             kvCache: 'q8',
@@ -377,6 +392,7 @@
           }
         } catch { dropSession(); } // stale/mismatched snapshot (e.g. new engine version): start fresh
         $('prompt').disabled = false; $('send').disabled = false; $('clear').disabled = false;
+        $('attach').disabled = !engine.vision;
         setPlaceholder(); $('prompt').focus();
         markCached(); refreshStorage();
       } catch (e) {
@@ -519,6 +535,54 @@
       status('<span class="ok">chat cleared</span> - the model forgot the conversation (KV cache reset, saved session removed).');
     };
 
+    // ── image attachments ──
+    // The attach button and paste (Ctrl+V) both add images. Images are decoded to RGB Float32Array
+    // on a canvas (the engine needs raw RGB, not a URL). Thumbnails show above the input.
+    const attachments = []; // { rgb: Float32Array, width, height, url: string }
+    const renderAttachments = () => {
+      const row = $('attRow');
+      row.replaceChildren();
+      row.classList.toggle('show', attachments.length > 0);
+      for (let i = 0; i < attachments.length; i++) {
+        const div = document.createElement('div');
+        div.className = 'att';
+        const img = document.createElement('img');
+        img.src = attachments[i].url;
+        div.appendChild(img);
+        const rm = document.createElement('button');
+        rm.className = 'rm'; rm.textContent = '×';
+        rm.onclick = (e) => { e.preventDefault(); attachments.splice(i, 1); renderAttachments(); };
+        div.appendChild(rm);
+        row.appendChild(div);
+      }
+    };
+    const addImageFromFile = async (file) => {
+      if (!file || !file.type.startsWith('image/')) return;
+      if (!engine?.vision) { status('<span class="err">this model has no vision tower - load the 27B to send images</span>'); return; }
+      const url = URL.createObjectURL(file);
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      // Draw to canvas at native size, extract RGB float data
+      const c = document.createElement('canvas');
+      c.width = img.naturalWidth; c.height = img.naturalHeight;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(img, 0, 0);
+      const { data } = ctx.getImageData(0, 0, c.width, c.height);
+      const rgb = new Float32Array(c.width * c.height * 3);
+      for (let i = 0, j = 0; i < data.length; i += 4, j += 3) {
+        rgb[j] = data[i] / 255; rgb[j + 1] = data[i + 1] / 255; rgb[j + 2] = data[i + 2] / 255;
+      }
+      attachments.push({ rgb, width: c.width, height: c.height, url });
+      renderAttachments();
+    };
+    $('attach').onclick = () => $('fileInput').click();
+    $('fileInput').onchange = (e) => { for (const f of e.target.files) addImageFromFile(f); e.target.value = ''; };
+    $('prompt').addEventListener('paste', (e) => {
+      if (!engine?.vision) return;
+      for (const item of e.clipboardData?.items ?? []) {
+        if (item.type.startsWith('image/')) { const f = item.getAsFile(); if (f) addImageFromFile(f); }
+      }
+    });
+
     // geometric-mean token probability from the per-token logprobs: an honest "how sure was the
     // model", straight from its own distribution (100% = every token was the obvious choice)
     const confidenceOf = (r) => (r.logprobs?.length ? Math.exp(r.logprobs.reduce((s, e) => s + e.logprob, 0) / r.logprobs.length) : null);
@@ -528,13 +592,24 @@
       if (!chat) return;
       if (busy) { abort?.abort(); return; } // Send doubles as Stop while generating
       const q = $('prompt').value.trim();
-      if (!q) return;
+      if (!q && attachments.length === 0) return;
       $('prompt').value = '';
       busy = true; $('send').textContent = 'Stop';
       abort = new AbortController();
-      bubble('user', q);
+      // Build multimodal content when images are attached (vision models only)
+      const hasImgs = attachments.length > 0 && engine?.vision;
+      const userContent = hasImgs
+        ? [
+            ...attachments.map((a) => ({ type: 'image', image: { rgb: a.rgb, width: a.width, height: a.height } })),
+            ...(q ? [{ type: 'text', text: q }] : [{ type: 'text', text: 'Describe this image.' }]),
+          ]
+        : q;
+      bubble('user', hasImgs ? `[${attachments.length} image${attachments.length > 1 ? 's' : ''}] ${q}` : q);
       const base = messages.length; // rollback point: error/early-abort unwinds to before this turn
-      messages.push({ role: 'user', content: q });
+      messages.push({ role: 'user', content: userContent });
+      // Clear attachments after sending
+      for (const a of attachments) URL.revokeObjectURL(a.url);
+      attachments.length = 0; renderAttachments();
       let out = bubble('assistant', '');
       out.classList.add('pending');
       let rawOut = ''; // the bubble's accumulated source text (markdown renders from this)

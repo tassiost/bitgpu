@@ -33,6 +33,7 @@ import {
   createVisionState,
   loadVisionWeights,
   preprocessImage,
+  numImageTokens,
   computeVisionPosEmbed,
   computeVisionRoPE,
   type VisionState,
@@ -365,6 +366,11 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   const fusedDec = !!opts.fusedDecode && useSG && !actF16 // not yet compatible with af16 path
   // fused QKV: merge the 3 post-QKV-matmul dispatches into one (kv8 + subgroup decode only)
   const fusedQKV = !!opts.fusedQKV && useSG && kv8 && !actF16 && !fusedDec
+  // Tiled/flash attention: split the O(N) KV cache scan into tiles.
+  // Both require subgroups + q8 KV cache + overflow 'error' (no sinks/roll).
+  const tiledAtt = !!opts.tiledAttention && useSG && kv8 && !roll
+  const flashAtt = !!opts.flashAttention && useSG && kv8 && !roll
+  const attTileSize = opts.attentionTileSize ?? 512
   const features: GPUFeatureName[] = []
   if (useSG) features.push('subgroups' as GPUFeatureName)
   // Request shader-f16 for vision tower f16 weight storage (ffn_down) if available.
@@ -500,6 +506,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     if (useSG) for (const n of ['attention_sg_kv8', 'rmsnorm_rope_sg_kv8']) specs.push([n, { SG: sgMax }])
     else specs.push(['attention_wg_kv8'])
     if (fusedQKV) specs.push(['qk_v_norm_rope_cache_sg', { SG: sgMax }])
+    if (tiledAtt || flashAtt) for (const n of ['attention_sg_kv8_tile', 'attention_sg_kv8_finalize', 'attention_sg_kv8_init']) specs.push([n, { SG: sgMax }])
   }
   if (actF16) {
     // f16-activation decode matmuls (shader-f16; subgroup path only) - the input-side f16 variants
@@ -535,6 +542,9 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     : useSG ? 'attention_sg' : 'attention_wg'
   const ROPE_K = kv16 ? 'rmsnorm_rope_sg_kv16' : 'rmsnorm_rope_sg' // fused-path K write into the cache (f32/f16; q8 branches)
   const COPY_KV = kv16 ? 'copy_kv16' : 'copy' //                      K/V append into the cache (f32/f16; q8 branches)
+  // Tiled/flash attention ping-pong buffers: m (running max), l (running sum), acc (weighted accumulation).
+  // Allocated lazily and grown when the segment size exceeds the current capacity.
+  const taBufs = (tiledAtt || flashAtt) ? { m: [actBuf(H), actBuf(H)] as [GPUBuffer, GPUBuffer], l: [actBuf(H), actBuf(H)] as [GPUBuffer, GPUBuffer], acc: [actBuf(H * Dh), actBuf(H * Dh)] as [GPUBuffer, GPUBuffer], S: 1 } : null
   if (A.hybrid) {
     // qwen3_5 hybrid backbone kernels (gated DeltaNet linear layers + gated full attention).
     for (const n of ['conv1d_causal', 'deltanet_gbeta', 'rope_partial', 'slice_cols', 'split_head', 'gate_sigmoid']) specs.push([n])
@@ -1339,7 +1349,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       })
       pass.setPipeline(pipe)
       pass.setBindGroup(0, bg)
-      pass.dispatchWorkgroups(numBlocksAligned)
+      // Split into 2D grid when numBlocksAligned exceeds WebGPU's 65535 per-dimension cap
+      // (the 27B model has tensors with >65535*64 blocks). The dequant_q10 shader uses
+      // global_invocation_id.x as the block index, so we need to update the shader to use
+      // a 2D index. For now, use the grid2d helper and update the shader.
+      if (numBlocksAligned > 65535) {
+        const y = Math.ceil(numBlocksAligned / 65535)
+        const x = Math.ceil(numBlocksAligned / y)
+        pass.dispatchWorkgroups(x, y, 1)
+      } else {
+        pass.dispatchWorkgroups(numBlocksAligned)
+      }
     }
     pass.end()
     // Copy part buffers into fused buffer slices
@@ -1940,7 +1960,90 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     return hn
   }
 
-  function layer(pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer {
+  // Tiled attention (single-pass): scans the KV cache in tiles within the current compute pass.
+  // Uses ping-pong m/l/acc buffers to carry online softmax state between tiles.
+  function runTiledAtt(pass: GPUComputePassEncoder, li: number, qr: GPUBuffer, S: number, posBase: number, att: GPUBuffer): void {
+    if (!taBufs) throw new Error('runTiledAtt: tiled attention buffers not allocated')
+    const SH = S * H, last = posBase + S - 1
+    let m0 = taBufs.m[0], m1 = taBufs.m[1], l0 = taBufs.l[0], l1 = taBufs.l[1], acc0 = taBufs.acc[0], acc1 = taBufs.acc[1]
+    // Grow buffers if segment exceeds current capacity
+    if (S > taBufs.S) {
+      m0 = actBuf(SH); m1 = actBuf(SH); l0 = actBuf(SH); l1 = actBuf(SH); acc0 = actBuf(SH * Dh); acc1 = actBuf(SH * Dh)
+      taBufs.m = [m0, m1]; taBufs.l = [l0, l1]; taBufs.acc = [acc0, acc1]; taBufs.S = S
+    } else if (S < taBufs.S && S === 1) {
+      m0 = actBuf(H); m1 = actBuf(H); l0 = actBuf(H); l1 = actBuf(H); acc0 = actBuf(H * Dh); acc1 = actBuf(H * Dh)
+      taBufs.m = [m0, m1]; taBufs.l = [l0, l1]; taBufs.acc = [acc0, acc1]; taBufs.S = 1
+    }
+    // Init: zero out m/l/acc (3 output buffers, no inputs — use setup directly)
+    setup(pass, 'attention_sg_kv8_init', [['u', SH], ['u', Dh]], [], [m0, l0, acc0])
+    pass.dispatchWorkgroups(isFull('attention_sg_kv8_init') ? Math.ceil(SH * Dh / 64) : 1)
+    let k = 0
+    for (let t = 0; t <= last; t += attTileSize) {
+      const tEnd = Math.min(t + attTileSize, last + 1)
+      const mIn = k === 0 ? m0 : m1, mOut = k === 0 ? m1 : m0
+      const lIn = k === 0 ? l0 : l1, lOut = k === 0 ? l1 : l0
+      const accIn = k === 0 ? acc0 : acc1, accOut = k === 0 ? acc1 : acc0
+      // Tile: 8 ins (q,Kq,Vq,Ks,Vs,m_in,l_in,acc_in) + 3 outs (m_out,l_out,acc_out) = 11 bindings
+      // All passed as "ins" with empty outs (matches the read_write storage in the shader)
+      setup(pass, 'attention_sg_kv8_tile',
+        [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', posBase + S], ['u', t], ['u', tEnd]],
+        [qr, Kc[li], Vc[li], Ksc[li], Vsc[li], mIn, lIn, accIn, mOut, lOut, accOut], [])
+      pass.dispatchWorkgroups(isFull('attention_sg_kv8_tile') ? SH : 1)
+      k ^= 1
+    }
+    const lFin = k === 0 ? l0 : l1, accFin = k === 0 ? acc0 : acc1
+    // Finalize: 2 ins (l_in, acc_in) + 1 out (out) — use runN
+    runN(pass, 'attention_sg_kv8_finalize', [['u', S], ['u', H], ['u', Dh]], [lFin, accFin], att, SH)
+  }
+
+  // Flash tiled attention (multi-pass): ends the current compute pass, creates separate passes
+  // for init → tile loop → finalize, then returns a new compute pass for subsequent operations.
+  // WebGPU inserts implicit barriers between passes in the same command encoder (no CPU-GPU sync).
+  function flashTiledAtt(enc: GPUCommandEncoder, pass: GPUComputePassEncoder, li: number, qr: GPUBuffer, S: number, posBase: number, att: GPUBuffer): GPUComputePassEncoder {
+    if (!taBufs) throw new Error('flashTiledAtt: tiled attention buffers not allocated')
+    const SH = S * H, last = posBase + S - 1
+    let m0 = taBufs.m[0], m1 = taBufs.m[1], l0 = taBufs.l[0], l1 = taBufs.l[1], acc0 = taBufs.acc[0], acc1 = taBufs.acc[1]
+    if (S > taBufs.S) {
+      m0 = actBuf(SH); m1 = actBuf(SH); l0 = actBuf(SH); l1 = actBuf(SH); acc0 = actBuf(SH * Dh); acc1 = actBuf(SH * Dh)
+      taBufs.m = [m0, m1]; taBufs.l = [l0, l1]; taBufs.acc = [acc0, acc1]; taBufs.S = S
+    } else if (S < taBufs.S && S === 1) {
+      m0 = actBuf(H); m1 = actBuf(H); l0 = actBuf(H); l1 = actBuf(H); acc0 = actBuf(H * Dh); acc1 = actBuf(H * Dh)
+      taBufs.m = [m0, m1]; taBufs.l = [l0, l1]; taBufs.acc = [acc0, acc1]; taBufs.S = 1
+    }
+    pass.end() // end the current pass — subsequent ops go into new passes
+    // Init pass: zero out m/l/acc buffers
+    {
+      const initPass = enc.beginComputePass()
+      setup(initPass, 'attention_sg_kv8_init', [['u', SH], ['u', Dh]], [], [m0, l0, acc0])
+      initPass.dispatchWorkgroups(isFull('attention_sg_kv8_init') ? Math.ceil(SH * Dh / 64) : 1)
+      initPass.end()
+    }
+    // Tile loop: each tile gets its own compute pass (implicit barrier between passes)
+    let k = 0
+    for (let t = 0; t <= last; t += attTileSize) {
+      const tEnd = Math.min(t + attTileSize, last + 1)
+      const mIn = k === 0 ? m0 : m1, mOut = k === 0 ? m1 : m0
+      const lIn = k === 0 ? l0 : l1, lOut = k === 0 ? l1 : l0
+      const accIn = k === 0 ? acc0 : acc1, accOut = k === 0 ? acc1 : acc0
+      const tilePass = enc.beginComputePass()
+      setup(tilePass, 'attention_sg_kv8_tile',
+        [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', posBase + S], ['u', t], ['u', tEnd]],
+        [qr, Kc[li], Vc[li], Ksc[li], Vsc[li], mIn, lIn, accIn, mOut, lOut, accOut], [])
+      tilePass.dispatchWorkgroups(isFull('attention_sg_kv8_tile') ? SH : 1)
+      tilePass.end()
+      k ^= 1
+    }
+    // Finalize pass: normalize acc by l and write output
+    {
+      const lFin = k === 0 ? l0 : l1, accFin = k === 0 ? acc0 : acc1
+      const finPass = enc.beginComputePass()
+      runN(finPass, 'attention_sg_kv8_finalize', [['u', S], ['u', H], ['u', Dh]], [lFin, accFin], att, SH)
+      finPass.end()
+    }
+    return enc.beginComputePass() // new pass for subsequent operations
+  }
+
+  function layer(enc: GPUCommandEncoder, pass: GPUComputePassEncoder, li: number, h: GPUBuffer, S: number, posBase: number, cos: GPUBuffer, sin: GPUBuffer): GPUBuffer | { cur: GPUBuffer; pass: GPUComputePassEncoder } {
     const Ltot = posBase + S
     if (manifest.arch.hybrid) return hybridLayer(pass, li, h, S, posBase, cos, sin)
     // f16-activation decode (activation:'f16'): active exactly when the fused S===1 subgroup path
@@ -2032,8 +2135,17 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     appendKV(pass, v, 1, li, S * KV, posBase * KV)
     cap(li, 'qr', qr)
     const att = actBuf(S * H * Dh)
-    const attF: Field[] = [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]]
-    runN(pass, ATT, attF, attIns(qr, li), att, S * H)
+    if (flashAtt && S > 1) {
+      // Flash attention: multi-pass tiling within the current command encoder.
+      // Returns a new compute pass for subsequent operations.
+      pass = flashTiledAtt(enc, pass, li, qr, S, posBase, att)
+    } else if (tiledAtt && S > 1) {
+      // Tiled attention: single-pass tiling within the current compute pass.
+      runTiledAtt(pass, li, qr, S, posBase, att)
+    } else {
+      const attF: Field[] = [['u', S], ['u', H], ['u', KV], ['u', Dh], ['u', posBase], ['u', Ltot]]
+      runN(pass, ATT, attF, attIns(qr, li), att, S * H)
+    }
     cap(li, 'att', att)
     const o = W[`layers.${li}.attn.o_proj`],
       h2 = actBuf(S * Hd)
@@ -2050,7 +2162,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     const d = W[`layers.${li}.mlp.down_proj`],
       hn = actBuf(S * Hd)
     residMM(pass, d, sw, h2, S, hn)
-    return hn
+    return flashAtt && S > 1 ? { cur: hn, pass } : hn
   }
   function lmHead(pass: GPUComputePassEncoder, fn: GPUBuffer, M: number, out: GPUBuffer): void {
     const lm = W.lm_head
@@ -2070,7 +2182,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
 
   function stack(enc: GPUCommandEncoder, h: GPUBuffer, S: number, posBase: number, mropePositions?: Float32Array): { fn: GPUBuffer; layer0: GPUBuffer | null } {
     const { cos, sin } = ropeBufs(posBase, S, mropePositions)
-    const pass = enc.beginComputePass()
+    let pass = enc.beginComputePass()
     // Arena reuse (see the arena block above) is poolless-path only - the decode loop has its own
     // slot pool. Protected from recycling: the caller's input `h` (forward() reads the embed batch
     // back after submit) and layer 0's output (forward()'s layer0 checkpoint) - and every layer's
@@ -2083,7 +2195,8 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       const mine: GPUBuffer[] = []
       if (useArena) arenaCur = mine
       const inH = cur
-      cur = layer(pass, li, inH, S, posBase, cos, sin)
+      const r = layer(enc, pass, li, inH, S, posBase, cos, sin)
+      if (typeof r === 'object' && 'cur' in r) { cur = r.cur; pass = r.pass } else cur = r
       if (li === 0) layer0 = cur
       if (useArena) {
         arenaCur = null
@@ -2161,8 +2274,13 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
   async function runPrefill(ids: number[], posBase: number, signal?: AbortSignal, imgInj?: { positions: number[]; embeds: GPUBuffer }, mropePositions?: Float32Array): Promise<{ fn: GPUBuffer; lastRow: number } | null> {
     let fn: GPUBuffer | null = null
     let lastRow = 0
-    const prefillSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
-    for (let off = 0; off < ids.length; off += prefillSeg) {
+    const baseSeg = ((globalThis as { __SEG?: number }).__SEG ?? 0) || PREFILL_SEG_HY // __SEG: test hook (verify-hybrid seg-equivalence + the real-27B segment sweep)
+    for (let off = 0; off < ids.length; ) {
+      // Adaptive segment sizing: shrink segments as KV cache position grows to avoid GPU watchdog
+      // timeouts. When tiled/flash attention is enabled, keep full-size segments (the tiling handles
+      // the long scan). Otherwise, halve the segment when the accumulated barrier iterations would
+      // exceed a threshold (~maxBarrierIters).
+      const prefillSeg = (tiledAtt || flashAtt) ? baseSeg : Math.min(baseSeg, Math.max(1, Math.floor(baseSeg / Math.max(1, (posBase + off) / baseSeg))))
       if (off > 0 && signal?.aborted) {
         fullHistory = []
         cacheLen = 0
@@ -3576,6 +3694,16 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     } catch { /* warm failure is non-fatal — the first real decode will JIT anyway */ }
   }
 
+  // Compute the number of image_token_id placeholders for a given image.
+  // Throws for text-only models. Does NOT require the mmproj pack to be loaded.
+  function numImageTokensForImage(image: ImageInput): number {
+    if (!visionState || !visionCfg) {
+      throw new Error('numImageTokens: this model has no vision tower (arch.vision is undefined)')
+    }
+    const { patches: _p, numPatches: _n, gridThw } = preprocessImage(image, visionCfg)
+    return numImageTokens(gridThw, visionCfg)
+  }
+
   // Vision tower forward pass (GPU dispatch). Only available when the model has a vision config.
   // The mmproj pack is loaded lazily on first call. Throws for text-only models.
   async function visionForward(images: ImageInput[]): Promise<VisionForwardResult> {
@@ -3998,7 +4126,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     capabilities,
     lost,
     vision: !!visionState,
-    ...(visionState ? { visionForward: serialize(visionForward), generateWithImages: serialize(generateWithImages) } : {}),
+    ...(visionState ? { visionForward: serialize(visionForward), generateWithImages: serialize(generateWithImages), numImageTokens: numImageTokensForImage } : {}),
     dispose: () => {
       tgt2Buf?.destroy()
       signTableBuf?.destroy()

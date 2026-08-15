@@ -9,8 +9,8 @@
 // The two text libraries (@huggingface/tokenizers, @huggingface/jinja - pure JS, Apache-2.0)
 // are inlined into dist/chat.js at build time, the same way the engine inlines its WGSL:
 // `bitgpu` stays a zero-dependency package, and importing plain `bitgpu` never loads chat code.
-import type { Engine, GenerateOptions, GenerateResult, KvSnapshot, TokenLogprobs } from '../types'
-import { ChatTokenizer, type ChatMessage, type DecoderStream } from './tokenizer'
+import type { Engine, GenerateOptions, GenerateResult, ImageInput, KvSnapshot, TokenLogprobs } from '../types'
+import { ChatTokenizer, type ChatMessage, type ContentPart, type DecoderStream, type ImageContent } from './tokenizer'
 import { ThinkSplitter, StopScanner, ThinkBudget } from './think'
 import { makeJsonFilter, TokenByteTable, validateJsonSchema, type JsonSchema } from './json'
 import { makeToolFilter, parseToolCall, parseToolCallXml, ToolCallSplitter, validateTools, type ChatTool, type PreparedTools, type ToolCall, type ToolChoice } from './tools'
@@ -409,8 +409,60 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const toolAppend = wantReuse && !userAppend && isToolAppend(committed, messages)
     let canReuse = userAppend || toolAppend
 
+    // ── Multimodal: detect image parts in any message ──
+    // When images are present, we stringify the content (replacing image parts with the
+    // correct number of <|image_pad|> tokens), apply the chat template, encode, find the
+    // image_token_id positions, and call engine.generateWithImages instead of generate.
+    // Cache reuse, tools, JSON mode, and think are disabled for image turns.
+    const imageTokenId = tk.tokenToId('<|image_pad|>')
+    const hasImages = imageTokenId !== undefined && messages.some(m => Array.isArray(m.content) && m.content.some(p => p.type === 'image'))
+    let imageInputs: ImageInput[] = []
+    let imagePositions: number[] = []
     let inputTokenIds: number[]
-    if (userAppend) {
+    if (hasImages) {
+      if (!engine.generateWithImages || !engine.numImageTokens) {
+        throw new Error('bitgpu/chat: this model has no vision tower (cannot send images)')
+      }
+      if (json) throw new Error('bitgpu/chat: images cannot be combined with JSON mode')
+      if (toolsGiven) throw new Error('bitgpu/chat: images cannot be combined with tools')
+      // Stringify messages: convert array content to string, replacing image parts with
+      // <|vision_start|> + <|image_pad|> * N + <|vision_end|>
+      const stringMsgs: ChatMessage[] = []
+      for (const m of messages) {
+        if (typeof m.content === 'string') { stringMsgs.push(m); continue }
+        let text = ''
+        for (const part of m.content as ContentPart[]) {
+          if (part.type === 'text') { text += part.text ?? ''; continue }
+          if (part.type === 'image' && part.image) {
+            const img = part.image
+            // Convert ImageContent to ImageInput (the engine needs raw RGB)
+            const input: ImageInput = {
+              rgb: img.rgb ?? new Float32Array(0),
+              width: img.width ?? 0,
+              height: img.height ?? 0,
+              frames: img.frames ?? 1,
+            }
+            if (!input.rgb.length && img.url) {
+              // URL images: fetch + decode in the caller (chat.html handles this before send)
+              throw new Error('bitgpu/chat: image URL decoding must be done before send (pass rgb data)')
+            }
+            const n = engine.numImageTokens(input)
+            imageInputs.push(input)
+            text += '<|vision_start|>'
+            for (let i = 0; i < n; i++) text += '<|image_pad|>'
+            text += '<|vision_end|>'
+          }
+        }
+        stringMsgs.push({ role: m.role, content: text, ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}) })
+      }
+      dropCache()
+      canReuse = false
+      inputTokenIds = tk.encode(tk.applyChatTemplate(stringMsgs, { addGenerationPrompt: true, enableThinking: false }), false)
+      // Find image_token_id positions in the encoded sequence
+      for (let i = 0; i < inputTokenIds.length; i++) {
+        if (inputTokenIds[i] === imageTokenId) imagePositions.push(i)
+      }
+    } else if (userAppend) {
       const w = wrap as ChatWrap
       const userText = messages[messages.length - 1].content
       // Reconstruct exactly what a cold render of [committed..., user] appends after the cached
@@ -518,7 +570,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         : null
     let result: GenerateResult
     try {
-      result = await engine.generate(inputTokenIds, {
+      const genOpts: GenerateOptions = {
         maxTokens,
         temperature: o.temperature,
         topK: o.topK,
@@ -554,7 +606,10 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
           tf?.advance(id)
           emit(splitter.push(decoder.push(id)))
         },
-      })
+      }
+      result = hasImages
+        ? await (engine.generateWithImages as (ids: number[], pos: number[], imgs: ImageInput[], opts: GenerateOptions) => Promise<GenerateResult>)(inputTokenIds, imagePositions, imageInputs, genOpts)
+        : await engine.generate(inputTokenIds, genOpts)
     } catch (err) {
       if (/maxSeqLen/.test((err as Error).message)) {
         // Thrown BEFORE the engine mutates any state, so the cache is still valid. Offer the
