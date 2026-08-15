@@ -68,17 +68,28 @@ export function repackQ8_0(
   const blocksPerRow = K / 32
   const packed = new Uint32Array(N * (K / 4))   // 8 u32 words per block
   const scales = new Float32Array(N * blocksPerRow)
-  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  // Use Uint16Array for f16 scales (little-endian, 2-byte aligned)
+  const u16 = new Uint16Array(data.buffer, data.byteOffset, data.byteLength >> 1)
 
   for (let row = 0; row < N; row++) {
+    const rowOff = row * blocksPerRow
+    const packedRowOff = row * (K / 4)
     for (let blk = 0; blk < blocksPerRow; blk++) {
-      const blockOff = (row * blocksPerRow + blk) * Q8_0_BLOCK_SIZE
-      // f16 scale → f32
-      scales[row * blocksPerRow + blk] = f16ToF32(dv.getUint16(blockOff, true))
-      // 32 int8 values → 8 u32 words (reinterpret bytes as little-endian u32)
-      for (let w = 0; w < 8; w++) {
-        packed[row * (K / 4) + blk * 8 + w] = dv.getUint32(blockOff + 2 + w * 4, true)
-      }
+      const blockOff = (rowOff + blk) * Q8_0_BLOCK_SIZE  // bytes
+      // f16 scale at blockOff (2 bytes) → f32
+      scales[rowOff + blk] = f16ToF32(u16[blockOff >> 1])
+      // 32 int8 values at blockOff + 2 (32 bytes = 8 u32 words)
+      // Use direct byte access (faster than DataView for unaligned offsets)
+      const dOff = blockOff + 2
+      const pOff = packedRowOff + blk * 8
+      packed[pOff]     = data[dOff]     | (data[dOff + 1]  << 8) | (data[dOff + 2]  << 16) | (data[dOff + 3]  << 24)
+      packed[pOff + 1] = data[dOff + 4] | (data[dOff + 5]  << 8) | (data[dOff + 6]  << 16) | (data[dOff + 7]  << 24)
+      packed[pOff + 2] = data[dOff + 8] | (data[dOff + 9]  << 8) | (data[dOff + 10] << 16) | (data[dOff + 11] << 24)
+      packed[pOff + 3] = data[dOff + 12]| (data[dOff + 13] << 8) | (data[dOff + 14] << 16) | (data[dOff + 15] << 24)
+      packed[pOff + 4] = data[dOff + 16]| (data[dOff + 17] << 8) | (data[dOff + 18] << 16) | (data[dOff + 19] << 24)
+      packed[pOff + 5] = data[dOff + 20]| (data[dOff + 21] << 8) | (data[dOff + 22] << 16) | (data[dOff + 23] << 24)
+      packed[pOff + 6] = data[dOff + 24]| (data[dOff + 25] << 8) | (data[dOff + 26] << 16) | (data[dOff + 27] << 24)
+      packed[pOff + 7] = data[dOff + 28]| (data[dOff + 29] << 8) | (data[dOff + 30] << 16) | (data[dOff + 31] << 24)
     }
   }
   return { packed, scales }
@@ -116,19 +127,29 @@ export function repackF16(
   return { data: copy, N, K }
 }
 
-/** Convert IEEE 754 half-precision (f16) bits to f32. */
+/** Convert IEEE 754 half-precision (f16) bits to f32.
+ *  Uses bit-level manipulation with a shared buffer for fast reinterpretation. */
+const _f16Buf = new ArrayBuffer(4)
+const _f16U32 = new Uint32Array(_f16Buf)
+const _f16F32 = new Float32Array(_f16Buf)
 function f16ToF32(bits: number): number {
-  const sign = (bits >> 15) & 1
-  const exp = (bits >> 10) & 0x1f
+  const sign = (bits & 0x8000) << 16
+  const exp = (bits & 0x7c00) >> 10
   const mant = bits & 0x3ff
   if (exp === 0) {
-    // Subnormal or zero
-    return (sign ? -1 : 1) * Math.pow(2, -14) * (mant / 1024)
+    if (mant === 0) { _f16U32[0] = sign; return _f16F32[0] }
+    // Subnormal: normalize to normal range
+    let m = mant, e = 0
+    while ((m & 0x400) === 0) { m <<= 1; e++ }
+    _f16U32[0] = sign | (((-14 - e + 127) & 0xff) << 23) | ((m & 0x3ff) << 13)
+    return _f16F32[0]
   }
   if (exp === 0x1f) {
-    return mant ? NaN : (sign ? -Infinity : Infinity)
+    _f16U32[0] = sign | 0x7f800000 | (mant ? 0x400000 : 0)
+    return _f16F32[0]
   }
-  return (sign ? -1 : 1) * Math.pow(2, exp - 15) * (1 + mant / 1024)
+  _f16U32[0] = sign | ((exp + 112) << 23) | (mant << 13)
+  return _f16F32[0]
 }
 
 /** Dequantize an F16 tensor to Float32Array. */
