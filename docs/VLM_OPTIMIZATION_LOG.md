@@ -936,3 +936,42 @@ Replaced bit-level f16→f32 conversion with a 65536-entry lookup table in repac
 - Engine creation: ~28s → ~25s (11% faster weight loading)
 - GPU compute: unchanged (LUT only affects CPU-side repacking)
 - The LUT is pre-computed at module load time and covers all 65536 possible f16 bit patterns.
+
+### F32 pre-dequantized weights experiment (2025-01-24)
+
+Tested pre-dequantizing Q8 weights to f32 on the GPU to eliminate Q8 dequant
+overhead from the matmul compute loop.
+
+**Approach**:
+1. Upload Q8 packed + scales to GPU as before
+2. Dispatch GPU dequant shader (Q8 → f32) for each weight matrix
+3. Use new f32 2D tiled matmul shaders (same tiling as Q8 but loads f32 W directly)
+4. Keep Q8 buffers alongside f32 (to avoid GPU race conditions with destroy)
+
+**Result**: 76% slower (5807ms min vs 3295ms baseline for 234 patches)
+
+**Analysis**: The Q8 dequantization was NOT on the critical path. It was hidden
+by the compute loop (GPU overlaps cooperative load with compute of previous tile).
+The f32 W approach uses 3.56× more global memory bandwidth (16 bytes per vec4
+vs 4.5 bytes for Q8 packed+scale), which becomes the new bottleneck.
+
+**Key learning**: Q8 in-shader dequantization is more efficient than pre-dequantization
+because:
+1. Q8 reduces global memory bandwidth by 3.56× (1.125 vs 4 bytes/element)
+2. The dequantization overhead (12 ops per 4 elements) is hidden by compute
+3. The cooperative load and compute are overlapped by the GPU's instruction scheduler
+4. Global memory bandwidth, not dequant compute, is the actual bottleneck
+
+### Benchmark variance analysis (2025-01-24)
+
+The 234-patch benchmark shows high variance across runs (3295ms to 7364ms for
+the same code). This is due to:
+
+1. **Thermal throttling**: The 30s engine creation + LLM generation heats up the
+   GPU, causing reduced clock speeds during the vision tower
+2. **Weight loading on first call**: The first visionForward call includes ~3000ms
+   of weight loading (HTTP fetch + CPU repacking + GPU upload)
+3. **Background processes**: macOS system tasks compete for GPU time
+
+**Recommendation**: For stable measurements, use GPU timestamp queries or run
+the vision tower in isolation (without LLM generation before/after).
