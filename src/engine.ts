@@ -2352,6 +2352,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
         await device.queue.onSubmittedWorkDone()
         flushTransients() // this segment's scratch is dead; the peak stays at one segment
       }
+      off += prefillSeg
     }
     return { fn: fn!, lastRow }
   }
@@ -2362,7 +2363,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
     await ensureKvCapacity(posBase + ids.length + nTokens)
     FULL = full
     const vocab = W.lm_head.N!
-    const tokBuf = device.createBuffer({ size: Math.max(1, nTokens) * 4, usage: S_ | CS }) // GPU-resident token ids
+    const tokBuf = device.createBuffer({ size: Math.max(1, nTokens) * 4, usage: S_ | CS | CD }) // GPU-resident token ids
     const embG = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD }) // GPU embedding of the current token (lives across the whole call)
     const lg = device.createBuffer({ size: vocab * 4, usage: S_ | CS })
     transients = [] // track prefill scratch so it can be destroyed once the prefill completes
@@ -3667,7 +3668,7 @@ async function createEngineInner(options: EngineOptions | string, holder: { devi
       transients = []
       const enc = device.createCommandEncoder()
       const embG = device.createBuffer({ size: Hd * 4, usage: S_ | CS | CD })
-      const tokBuf = device.createBuffer({ size: 4, usage: S_ | CS })
+      const tokBuf = device.createBuffer({ size: 4, usage: S_ | CS | CD })
       device.queue.writeBuffer(tokBuf, 0, new Uint32Array([1])) // dummy token id
       // embed_gather: reads tokBuf[0], writes the embedding into embG
       const pass0 = enc.beginComputePass()
