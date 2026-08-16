@@ -293,6 +293,11 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     tk = new ChatTokenizer(json, cfg as Record<string, unknown>)
   }
   const wrap = deriveChatWrap(tk)
+  // The ilda markers this model uses: the Qwen3.5/Bonsai family keeps them space-prefixed
+  // (' thinking' / ' response' added tokens), GLM-style models bare ('<think>'/'</think>').
+  const thinkOpenTag = tk.tokenToId(' thinking') != null ? ' thinking' : '<think>'
+  const thinkCloseTag = tk.tokenToId(' response') != null ? ' response' : '</think>'
+  const thinkMarkersSuffix = '\n' + thinkOpenTag + '\n\n' + thinkCloseTag + '\n\n'
   // Some templates (Qwen3.5) PRE-OPEN <think> in the thinking-mode generation prompt: the opening tag
   // is in the prompt, not the generated stream, so the ThinkSplitter and tool filter must start
   // already inside the think block (else the reasoning + </think> leak into the visible reply).
@@ -300,11 +305,33 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     if (!tk.hasChatTemplate) return false
     try {
       const r = tk.applyChatTemplate([{ role: 'user', content: 'x' }], { addGenerationPrompt: true, enableThinking: true })
-      return r.lastIndexOf('<think>') > r.lastIndexOf('</think>')
+      return r.lastIndexOf(thinkOpenTag) > r.lastIndexOf(thinkCloseTag)
     } catch {
       return false
     }
   })()
+  // Some templates pre-render BOTH ilda markers in the generation prompt (e.g.
+  // `<|im_start|>assistant\n thinking\n\n response\n\n`), so the model never emits
+  // ` thinking` itself and hidden reasoning can never start. For those, think turns
+  // rebuild the prompt to open ONLY the think block (the ThinkSplitter starts inside it;
+  // the ThinkBudget closes it with ` response`). Non-think turns render byte-identically
+  // (cache reuse depends on it).
+  const genHasPreRenderedPair = ((): boolean => {
+    if (!tk.hasChatTemplate) return false
+    try {
+      const r = tk.applyChatTemplate([{ role: 'user', content: 'x' }], { addGenerationPrompt: true, enableThinking: true })
+      return r.endsWith(thinkMarkersSuffix)
+    } catch {
+      return false
+    }
+  })()
+  const renderTurnPrompt = (messages: ChatMessage[], opts: { enableThinking?: boolean; tools?: readonly unknown[] }): string => {
+    const r = tk.applyChatTemplate(messages, { addGenerationPrompt: true, ...opts })
+    if (!(opts.enableThinking ?? false) || !genHasPreRenderedPair) return r
+    return r.endsWith(thinkMarkersSuffix)
+      ? r.slice(0, r.length - thinkMarkersSuffix.length) + '\n' + thinkOpenTag + '\n'
+      : r
+  }
 
   // ── conversation state ──
   // `committed` mirrors what the engine's KV cache holds, as messages; null = cache not usable.
@@ -362,7 +389,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
       tools,
       forced: typeof choice === 'object' ? choice.name : null,
       format: toolFormat,
-      ids: { open, close, eos: tk.eosTokenId, thinkOpen: tk.tokenToId('<think>'), thinkClose: tk.tokenToId('</think>') },
+      ids: { open, close, eos: tk.eosTokenId, thinkOpen: tk.tokenToId(thinkOpenTag), thinkClose: tk.tokenToId(thinkCloseTag) },
     }
   }
 
@@ -404,6 +431,9 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // format wins over think (a think block cannot be valid JSON); a FORCED tool call also
     // implies think: false (the whole reply is the enforced call).
     const think = !json && prep?.forced == null && (o.think ?? false)
+    // The generation prompt opens the think block for this turn: the template pre-opens it
+    // (thinkPreopened), or we rebuilt it from a pre-rendered marker pair (genHasPreRenderedPair).
+    const preopened = think && (thinkPreopened || genHasPreRenderedPair)
     const wantReuse = (o.reuseCache ?? true) && !think && wrap !== null && toolsKey === committedToolsKey
     const userAppend = wantReuse && isCleanAppend(committed, messages)
     const toolAppend = wantReuse && !userAppend && isToolAppend(committed, messages)
@@ -497,15 +527,15 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
         // Neither reconstruction is valid: full-prefill the conversation (correct, no cache reuse).
         dropCache()
         canReuse = false
-        inputTokenIds = tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: think, tools: prep?.tools }), false)
+        inputTokenIds = tk.encode(renderTurnPrompt(messages, { enableThinking: think, tools: prep?.tools }), false)
       }
     } else {
       dropCache()
-      inputTokenIds = tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: true, enableThinking: think, tools: prep?.tools }), false)
+      inputTokenIds = tk.encode(renderTurnPrompt(messages, { enableThinking: think, tools: prep?.tools }), false)
     }
 
     const decoder: DecoderStream = tk.createDecoderStream(true)
-    const splitter = new ThinkSplitter('<think>', '</think>', think && thinkPreopened)
+    const splitter = new ThinkSplitter(thinkOpenTag, thinkCloseTag, preopened)
     // Stop sequences scan the VISIBLE channel; on a match the engine is aborted via an internal
     // signal (a few overrun tokens may generate before the per-step abort check lands - the text
     // is cut exactly, and the cache is dropped afterwards so the overrun can never be reused).
@@ -554,7 +584,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     const jf = json ? makeJsonFilter((byteTable ??= new TokenByteTable(tk)), tk.eosTokenId, schema) : null
     // Tool turns: free text until <tool_call> opens, then the body grammar (declared names +
     // per-tool schema) until </tool_call>; a forced choice pins the whole reply to one call.
-    const tf = prep ? makeToolFilter((byteTable ??= new TokenByteTable(tk)), prep, think && thinkPreopened) : null
+    const tf = prep ? makeToolFilter((byteTable ??= new TokenByteTable(tk)), prep, preopened) : null
     // thinkBudget: once the budget is spent inside <think>, the ONLY permitted candidate is
     // </think> (the engine's constrained pick walks the full vocab when it is outside the top-K),
     // then generation continues unconstrained into the visible reply.
@@ -565,8 +595,8 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // difficulty workloads where one cap can't fit every question.
     const tes = o.thinkEarlyStop ? { gap: 6, window: 16, minTokens: 64, ...(o.thinkEarlyStop === true ? {} : o.thinkEarlyStop) } : null
     const tb =
-      think && (o.thinkBudget != null || tes) && tk.tokenToId('</think>') != null
-        ? new ThinkBudget(tk.tokenToId('<think>'), tk.tokenToId('</think>'), Math.max(0, o.thinkBudget ?? Infinity), thinkPreopened, tes)
+      think && (o.thinkBudget != null || tes) && tk.tokenToId(thinkCloseTag) != null
+        ? new ThinkBudget(tk.tokenToId(thinkOpenTag), tk.tokenToId(thinkCloseTag), Math.max(0, o.thinkBudget ?? Infinity), preopened, tes)
         : null
     let result: GenerateResult
     try {
@@ -738,7 +768,9 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     },
     prewarm: serialize(prewarmImpl),
     countTokens: (messages: ChatMessage[], opts?: { addGenerationPrompt?: boolean; think?: boolean; tools?: ChatTool[] }): number =>
-      tk.encode(tk.applyChatTemplate(messages, { addGenerationPrompt: opts?.addGenerationPrompt ?? true, enableThinking: opts?.think ?? false, tools: opts?.tools }), false).length,
+      tk.encode(opts?.addGenerationPrompt === false
+        ? tk.applyChatTemplate(messages, { addGenerationPrompt: false, enableThinking: opts?.think ?? false, tools: opts?.tools })
+        : renderTurnPrompt(messages, { enableThinking: opts?.think ?? false, tools: opts?.tools }), false).length,
     reset: (): void => {
       // Synchronous like engine.resetCache(); a turn in flight sees the epoch bump and will not
       // commit, so the next turn starts from the cleared transcript (a clean full prefill).
