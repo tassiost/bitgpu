@@ -632,7 +632,10 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
             ? (ids, vals) => {
                 tb?.observe(vals)
                 const forced = tb?.force()
-                if (forced != null) return [forced]
+                if (forced != null) {
+                  splitter.forceClose() // the forced close must end the block even below the minimum
+                  return [forced]
+                }
                 if (tb && !tb.allowEos()) {
                   // Below the minimum think length, eos would end the turn with no answer - the
                   // swallowed close must not let the model finish. Drop eos from the candidates.

@@ -22,6 +22,7 @@ export class ThinkSplitter {
   private hold = ''
   private minChars = 0
   private thinkChars = 0
+  private forceCloseFlag = false
   constructor(
     private readonly open = '<think>',
     private readonly close = '</think>',
@@ -64,7 +65,7 @@ export class ThinkSplitter {
           this.hold = s.slice(safe)
           return { text, think }
         }
-        if (this.minChars > 0 && this.thinkChars + i < this.minChars) {
+        if (this.minChars > 0 && !this.forceCloseFlag && this.thinkChars + i < this.minChars) {
           // Close too early (below the minimum): the close string is just think content for now -
           // ThinkBudget swallows the same close on token ids. Keep scanning for a later close.
           think += s.slice(0, i + this.close.length)
@@ -75,8 +76,15 @@ export class ThinkSplitter {
         think += s.slice(0, i)
         s = s.slice(i + this.close.length)
         this.inside = false
+        this.forceCloseFlag = false
       }
     }
+  }
+
+  /** Accept the next close string as a close regardless of the minimum (mirrors the budget's
+   *  FORCED close - the engine is emitting the forced token, so it must end the think block). */
+  forceClose(): void {
+    this.forceCloseFlag = true
   }
 
   /** Emit whatever is held back. An unterminated think block (generation hit maxTokens inside it)
@@ -150,6 +158,7 @@ export class ThinkBudget {
   private closed = false
   private run = 0 //         consecutive confident steps (early stop)
   private earlyFired = false
+  private forced = false //  the engine is emitting our forced close this step
   private seen = false //    observe() already ran for the current step (see below)
   constructor(
     private readonly openId: number | undefined,
@@ -170,11 +179,15 @@ export class ThinkBudget {
       if (this.openId != null && id === this.openId) this.inThink = true
       return
     }
-    if (this.closeId != null && id === this.closeId && this.spent >= this.minThink) {
+    if (this.closeId != null && id === this.closeId && (this.forced || this.spent >= this.minThink)) {
+      // A FORCED close (budget/early stop) is never swallowed - it must always close the block,
+      // even when the minimum is still pending (the splitter mirrors this via forceClose()).
+      this.forced = false
       this.inThink = false
       this.closed = true
       return
     }
+    this.forced = false
     this.spent++
     this.seen = false // next step's first observe() counts again
   }
@@ -194,7 +207,11 @@ export class ThinkBudget {
   /** The forced token id once the budget is exhausted or early stop fired, else null. */
   force(): number | null {
     if (!this.inThink || this.closed || this.closeId == null) return null
-    return this.spent >= this.budget || this.earlyFired ? this.closeId : null
+    if (this.spent >= this.budget || this.earlyFired) {
+      this.forced = true
+      return this.closeId
+    }
+    return null
   }
 
   /** May the engine end generation (eos)? A swallowed close must not let the model "finish"
