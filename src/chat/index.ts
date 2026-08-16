@@ -87,6 +87,12 @@ export interface ChatSendOptions {
    *  slow on-device decode. `0` suppresses reasoning entirely (thinking template, no think
    *  tokens). Unset = unlimited. Ignored when `think` is off. */
   thinkBudget?: number
+  /** MINIMUM reasoning (thinking mode only): the first `thinkMinTokens` think tokens may not
+   *  be ` response` - the model's own close tag is swallowed (counted as reasoning) until the
+   *  minimum is spent, so the reasoning block reliably appears even for questions the model
+   *  would answer directly. `thinkBudget` forcing still closes at the cap, even before the
+   *  minimum. 0/unset = close anytime. Ignored when `think` is off. */
+  thinkMinTokens?: number
   /** ADAPTIVE early stop for the reasoning phase (thinking mode only; composes with
    *  `thinkBudget`, which stays the hard cap): when the model has been decisively confident -
    *  top-1 vs top-2 logit gap >= `gap` - for `window` consecutive think tokens after at least
@@ -535,7 +541,7 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     }
 
     const decoder: DecoderStream = tk.createDecoderStream(true)
-    const splitter = new ThinkSplitter(thinkOpenTag, thinkCloseTag, preopened)
+    const splitter = new ThinkSplitter(thinkOpenTag, thinkCloseTag, preopened, o.thinkMinTokens ?? 0)
     // Stop sequences scan the VISIBLE channel; on a match the engine is aborted via an internal
     // signal (a few overrun tokens may generate before the per-step abort check lands - the text
     // is cut exactly, and the cache is dropped afterwards so the overrun can never be reused).
@@ -595,8 +601,8 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
     // difficulty workloads where one cap can't fit every question.
     const tes = o.thinkEarlyStop ? { gap: 6, window: 16, minTokens: 64, ...(o.thinkEarlyStop === true ? {} : o.thinkEarlyStop) } : null
     const tb =
-      think && (o.thinkBudget != null || tes) && tk.tokenToId(thinkCloseTag) != null
-        ? new ThinkBudget(tk.tokenToId(thinkOpenTag), tk.tokenToId(thinkCloseTag), Math.max(0, o.thinkBudget ?? Infinity), preopened, tes)
+      think && (o.thinkBudget != null || tes || (o.thinkMinTokens ?? 0) > 0) && tk.tokenToId(thinkCloseTag) != null
+        ? new ThinkBudget(tk.tokenToId(thinkOpenTag), tk.tokenToId(thinkCloseTag), Math.max(0, o.thinkBudget ?? Infinity), preopened, tes, o.thinkMinTokens ?? 0)
         : null
     let result: GenerateResult
     try {

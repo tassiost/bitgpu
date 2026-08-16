@@ -20,14 +20,22 @@ export interface SplitChunk {
 export class ThinkSplitter {
   private inside: boolean
   private hold = ''
+  private minChars = 0
+  private thinkChars = 0
   constructor(
     private readonly open = '<think>',
     private readonly close = '</think>',
     /** Start already inside a think block - for templates whose generation prompt PRE-OPENS `<think>`
      *  (e.g. Qwen3.5 thinking mode), so the opening tag is in the prompt, not the generated stream. */
     startInside = false,
+    /** Minimum reasoning TOKENS before a NATURAL close is accepted (0 = close anytime). The
+     *  token-accurate gate is ThinkBudget.minThink; this char-based mirror (~2.5 chars/token for
+     *  typical prose) only keeps the stream routed correctly while the budget swallows closes -
+     *  the exact gate can differ by a token or two without corrupting anything. */
+    minThink = 0,
   ) {
     this.inside = startInside
+    this.minChars = Math.round(minThink * 2.5)
   }
 
   push(chunk: string): SplitChunk {
@@ -52,8 +60,17 @@ export class ThinkSplitter {
         if (i === -1) {
           const safe = holdback(s, this.close)
           think += s.slice(0, safe)
+          this.thinkChars += safe
           this.hold = s.slice(safe)
           return { text, think }
+        }
+        if (this.minChars > 0 && this.thinkChars + i < this.minChars) {
+          // Close too early (below the minimum): the close string is just think content for now -
+          // ThinkBudget swallows the same close on token ids. Keep scanning for a later close.
+          think += s.slice(0, i + this.close.length)
+          this.thinkChars += i + this.close.length
+          s = s.slice(i + this.close.length)
+          continue
         }
         think += s.slice(0, i)
         s = s.slice(i + this.close.length)
@@ -140,6 +157,9 @@ export class ThinkBudget {
     private readonly budget: number,
     startInside: boolean,
     private readonly early: ThinkEarlyStop | null = null,
+    /** Minimum reasoning TOKENS the model must generate before its OWN close tag is accepted
+     *  (budget forcing still closes at `budget` even if that fires earlier). 0 = close anytime. */
+    private readonly minThink = 0,
   ) {
     this.inThink = startInside
   }
@@ -150,7 +170,7 @@ export class ThinkBudget {
       if (this.openId != null && id === this.openId) this.inThink = true
       return
     }
-    if (this.closeId != null && id === this.closeId) {
+    if (this.closeId != null && id === this.closeId && this.spent >= this.minThink) {
       this.inThink = false
       this.closed = true
       return
