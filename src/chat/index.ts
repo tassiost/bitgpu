@@ -633,6 +633,12 @@ export async function createChat(engine: Engine, options: ChatOptions): Promise<
                 tb?.observe(vals)
                 const forced = tb?.force()
                 if (forced != null) return [forced]
+                if (tb && !tb.allowEos()) {
+                  // Below the minimum think length, eos would end the turn with no answer - the
+                  // swallowed close must not let the model finish. Drop eos from the candidates.
+                  const eos = tk.eosTokenId
+                  ids = ids.filter(id => id !== eos)
+                }
                 return jf ? jf.filter(ids) : tf ? tf.filter(ids) : Array.from(ids)
               }
             : undefined,

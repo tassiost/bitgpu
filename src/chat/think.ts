@@ -196,4 +196,11 @@ export class ThinkBudget {
     if (!this.inThink || this.closed || this.closeId == null) return null
     return this.spent >= this.budget || this.earlyFired ? this.closeId : null
   }
+
+  /** May the engine end generation (eos)? A swallowed close must not let the model "finish"
+   *  without its minimum reasoning - while inside think below the minimum, eos is filtered out
+   *  of the candidates so the model keeps reasoning until the block can close. */
+  allowEos(): boolean {
+    return !this.inThink || this.closed || this.spent >= this.minThink
+  }
 }
